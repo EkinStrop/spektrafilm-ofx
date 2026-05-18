@@ -1,0 +1,4116 @@
+#include "SpektraMetalRenderer.h"
+#include "SpektraProfileCurves.h"
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#ifndef __has_feature
+#  define __has_feature(x) 0
+#endif
+
+#if !__has_feature(objc_arc)
+#  error "SpektraMetalRenderer.mm must be compiled with Objective-C ARC (-fobjc-arc)."
+#endif
+
+namespace spektrafilm {
+
+namespace {
+
+int bundleImageAnchor = 0;
+
+NSURL *findBundleResourceURL(NSString *name, NSString *extension) {
+  NSBundle *pluginBundle = [NSBundle bundleWithIdentifier:@"org.spektrafilm.ofx"];
+  if (pluginBundle) {
+    NSURL *url = [pluginBundle URLForResource:name withExtension:extension];
+    if (url) {
+      return url;
+    }
+  }
+  for (NSBundle *candidate in [NSBundle allBundles]) {
+    NSURL *url = [candidate URLForResource:name withExtension:extension];
+    if (url) {
+      return url;
+    }
+  }
+  NSString *fallback = [[NSBundle mainBundle] pathForResource:name ofType:extension];
+  if (fallback) {
+    return [NSURL fileURLWithPath:fallback];
+  }
+
+  NSMutableArray<NSString *> *fallbackDirectories = [NSMutableArray array];
+  NSString *resourceDir = [[[NSProcessInfo processInfo] environment] objectForKey:@"SPEKTRAFILM_RESOURCE_DIR"];
+  if ([resourceDir length] > 0) {
+    [fallbackDirectories addObject:resourceDir];
+  }
+  NSString *mainResourcePath = [[NSBundle mainBundle] resourcePath];
+  if ([mainResourcePath length] > 0) {
+    [fallbackDirectories addObject:mainResourcePath];
+  }
+  Dl_info imageInfo;
+  if (dladdr(&bundleImageAnchor, &imageInfo) != 0 && imageInfo.dli_fname) {
+    NSString *imagePath = [NSString stringWithUTF8String:imageInfo.dli_fname];
+    NSString *imageDirectory = [imagePath stringByDeletingLastPathComponent];
+    NSString *contentsDirectory = [imageDirectory stringByDeletingLastPathComponent];
+    if ([contentsDirectory length] > 0) {
+      [fallbackDirectories addObject:[contentsDirectory stringByAppendingPathComponent:@"Resources"]];
+    }
+    if ([imageDirectory length] > 0) {
+      [fallbackDirectories addObject:imageDirectory];
+    }
+  }
+  NSString *executablePath = [[NSBundle mainBundle] executablePath];
+  NSString *executableDirectory = [executablePath stringByDeletingLastPathComponent];
+  if ([executableDirectory length] > 0) {
+    [fallbackDirectories addObject:executableDirectory];
+  }
+  NSString *currentDirectory = [[NSFileManager defaultManager] currentDirectoryPath];
+  if ([currentDirectory length] > 0) {
+    [fallbackDirectories addObject:currentDirectory];
+  }
+
+  NSFileManager *fileManager = [NSFileManager defaultManager];
+  for (NSString *directory in fallbackDirectories) {
+    NSString *path = [[directory stringByAppendingPathComponent:name] stringByAppendingPathExtension:extension];
+    if ([fileManager fileExistsAtPath:path]) {
+      return [NSURL fileURLWithPath:path];
+    }
+  }
+  return nil;
+}
+
+using PerfClock = std::chrono::steady_clock;
+
+double elapsedMilliseconds(PerfClock::time_point start, PerfClock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+bool envFlagEnabled(const char *name) {
+  const char *value = std::getenv(name);
+  if (!value) {
+    return false;
+  }
+  return std::strcmp(value, "1") == 0 ||
+         std::strcmp(value, "true") == 0 ||
+         std::strcmp(value, "TRUE") == 0 ||
+         std::strcmp(value, "yes") == 0 ||
+         std::strcmp(value, "YES") == 0 ||
+         std::strcmp(value, "on") == 0 ||
+         std::strcmp(value, "ON") == 0;
+}
+
+std::string envString(const char *name, const char *fallback = "") {
+  const char *value = std::getenv(name);
+  return value ? std::string(value) : std::string(fallback);
+}
+
+struct KernelParams {
+  int32_t process;
+  int32_t rgbToRawMethod;
+  int32_t inputColorSpace;
+  int32_t outputColorSpace;
+  int32_t outputRole;
+  int32_t hdrPreset;
+  int32_t hdrTransfer;
+  float hdrReferenceWhiteNits;
+  float hdrPeakNits;
+  float hdrExposureEv;
+  int32_t hdrToneMapping;
+  uint32_t _padColor0;
+  int32_t film;
+  int32_t paper;
+  int32_t printTiming;
+  float filmExposureEv;
+  uint32_t autoExposureEnabled;
+  int32_t autoExposureMethod;
+  float autoExposureEv;
+  float _padAutoExposure0;
+  float printExposureEv;
+  float filmGamma;
+  float printGamma;
+  float printShadowShape;
+  float printHighlightShape;
+  int32_t filmPushPullMode;
+  float filmPushPullStops;
+  int32_t printPushPullMode;
+  float printPushPullStops;
+  float negativeBleachBypassAmount;
+  float negativeLeucoCyanCoupling;
+  float printBleachBypassAmount;
+  float _padBleachBypass1;
+  float filterC;
+  float filterMShift;
+  float filterYShift;
+  float enlargerScale;
+  float enlargerOffsetXPercent;
+  float enlargerOffsetYPercent;
+  float _padEnlarger0;
+  float preflashExposure;
+  float preflashMFilterShift;
+  float preflashYFilterShift;
+  float printerLightsR;
+  float printerLightsG;
+  float printerLightsB;
+  uint32_t printerLightsGang;
+  uint32_t printerLightCalibration;
+  float dirCouplersAmount;
+  float dirCouplersDiffusionUm;
+  uint32_t grainEnabled;
+  int32_t grainModel;
+  int32_t filmFormat;
+  uint32_t grainSublayersEnabled;
+  int32_t grainSubLayerCount;
+  float grainParticleAreaUm2;
+  float grainParticleScaleR;
+  float grainParticleScaleG;
+  float grainParticleScaleB;
+  float grainParticleScaleLayer0;
+  float grainParticleScaleLayer1;
+  float grainParticleScaleLayer2;
+  float grainDensityMinR;
+  float grainDensityMinG;
+  float grainDensityMinB;
+  float grainUniformityR;
+  float grainUniformityG;
+  float grainUniformityB;
+  float grainFinalBlurUm;
+  float grainBlurDyeCloudsUm;
+  float grainMicroStructureScale;
+  float grainMicroStructureSigmaNm;
+  uint32_t grainSeed;
+  uint32_t grainAnimate;
+  float filmPixelSizeUm;
+  float _padGrain0;
+  int32_t grainSynthesisSamples;
+  float grainSynthesisAmount;
+  float grainSynthesisMeanRadiusUm;
+  float grainSynthesisRadiusStdDevRatio;
+  float grainSynthesisObservationSigmaUm;
+  float grainSynthesisCellSizeRatio;
+  float grainSynthesisMaxRadiusQuantile;
+  float grainSynthesisCoverageEpsilon;
+  int32_t grainSynthesisMaxGrainsPerCell;
+  float grainSynthesisRadiusScaleR;
+  float grainSynthesisRadiusScaleG;
+  float grainSynthesisRadiusScaleB;
+  float grainSynthesisLayerScale0;
+  float grainSynthesisLayerScale1;
+  float grainSynthesisLayerScale2;
+  uint32_t grainSynthesisLayered;
+  uint32_t _padGrainSynthesis0;
+  uint32_t halationEnabled;
+  float scatterAmount;
+  float scatterScale;
+  float halationAmount;
+  float halationScale;
+  float halationStrengthR;
+  float halationStrengthG;
+  float halationStrengthB;
+  float halationFirstSigmaUmR;
+  float halationFirstSigmaUmG;
+  float halationFirstSigmaUmB;
+  uint32_t cameraDiffusionEnabled;
+  int32_t cameraDiffusionFamily;
+  float cameraDiffusionStrength;
+  float cameraDiffusionSpatialScale;
+  float cameraDiffusionHaloWarmth;
+  float cameraDiffusionCoreIntensity;
+  float cameraDiffusionCoreSize;
+  float cameraDiffusionHaloIntensity;
+  float cameraDiffusionHaloSize;
+  float cameraDiffusionBloomIntensity;
+  float cameraDiffusionBloomSize;
+  uint32_t printDiffusionEnabled;
+  int32_t printDiffusionFamily;
+  float printDiffusionStrength;
+  float printDiffusionSpatialScale;
+  float printDiffusionHaloWarmth;
+  float printDiffusionCoreIntensity;
+  float printDiffusionCoreSize;
+  float printDiffusionHaloIntensity;
+  float printDiffusionHaloSize;
+  float printDiffusionBloomIntensity;
+  float printDiffusionBloomSize;
+  uint32_t scannerEnabled;
+  uint32_t scannerWhiteCorrection;
+  uint32_t scannerBlackCorrection;
+  float scannerWhiteLevel;
+  float scannerBlackLevel;
+  float glarePercent;
+  float scannerBlurSigmaPx;
+  float scannerUnsharpSigmaPx;
+  float scannerUnsharpAmount;
+  float time;
+};
+
+constexpr uint32_t kGrainSynthesisComponentCount = 9u;
+constexpr uint32_t kGrainSynthesisMaxSamples = 1024u;
+constexpr uint32_t kGrainSynthesisMaxRadiusLutSize = 512u;
+constexpr uint32_t kGrainSynthesisMaxCellOffsetsPerComponent = 16384u;
+
+struct KernelGrainSynthesisComponentInfo {
+  float scaledMeanRadius;
+  float maxRadius;
+  float maxRadiusSquared;
+  float cellSize;
+  float invCellSize;
+  float meanArea;
+  float cellArea;
+  float densityToLambda;
+  float logMean;
+  float logSigma;
+  uint32_t grainCap;
+  uint32_t cellScanRadius;
+  uint32_t sampleCount;
+  uint32_t active;
+  uint32_t radiusLutOffset;
+  uint32_t radiusLutSize;
+  uint32_t cellOffsetStart;
+  uint32_t cellOffsetCount;
+  uint32_t samplerMode;
+  uint32_t _pad0;
+};
+
+struct KernelGrainSynthesisSampleOffset {
+  float x;
+  float y;
+};
+
+struct KernelGrainSynthesisCellOffset {
+  int32_t x;
+  int32_t y;
+};
+
+static_assert(sizeof(KernelGrainSynthesisComponentInfo) == 80u);
+static_assert(sizeof(KernelGrainSynthesisSampleOffset) == 8u);
+static_assert(sizeof(KernelGrainSynthesisCellOffset) == 8u);
+
+enum class GrainSynthesisSamplerMode : uint32_t {
+  R2 = 0u,
+  Antithetic = 1u,
+  SobolBlue = 2u,
+};
+
+enum class GrainSynthesisCellMode : uint32_t {
+  Current = 0u,
+  OffsetList = 1u,
+  ThreadgroupCache = 2u,
+};
+
+enum class GrainSynthesisTargetStorageMode : uint32_t {
+  FloatBuffer = 0u,
+  HalfBuffer = 1u,
+  R16TextureArray = 2u,
+};
+
+struct KernelCurveInfo {
+  uint32_t exposureCount;
+  uint32_t _pad0;
+  uint32_t _pad1;
+  uint32_t _pad2;
+};
+
+struct KernelSpectralInfo {
+  uint32_t filmWavelengthCount;
+  uint32_t hanatosWidth;
+  uint32_t hanatosHeight;
+  uint32_t hanatosWavelengthCount;
+  uint32_t filmCount;
+  uint32_t paperCount;
+  uint32_t filmPositive;
+  uint32_t _padCount1;
+  float mallettRawMidgrayGreen;
+  float filmDensityCurveMinimum0;
+  float filmDensityCurveMinimum1;
+  float filmDensityCurveMinimum2;
+  float filmDensityCurveMaximum0;
+  float filmDensityCurveMaximum1;
+  float filmDensityCurveMaximum2;
+  float _padDensityCurveMaximum0;
+  float paperDensityCurveMaximum0;
+  float paperDensityCurveMaximum1;
+  float paperDensityCurveMaximum2;
+  float _padPaperDensityCurveMaximum0;
+};
+
+struct KernelColorInfo {
+  uint32_t colorSpaceCount;
+  uint32_t transferLutSize;
+  float decodeMin;
+  float decodeMax;
+  float encodeMin;
+  float encodeMax;
+  float _pad0;
+  float _pad1;
+};
+
+struct KernelDirInfo {
+  float matrix00;
+  float matrix01;
+  float matrix02;
+  float matrix10;
+  float matrix11;
+  float matrix12;
+  float matrix20;
+  float matrix21;
+  float matrix22;
+  float densityMax0;
+  float densityMax1;
+  float densityMax2;
+};
+
+struct KernelDiffusionInfo {
+  uint32_t componentCount;
+  float scatterFraction;
+  uint32_t _pad0;
+  uint32_t _pad1;
+};
+
+struct KernelDiffusionComponent {
+  float sigmaPx;
+  float weightR;
+  float weightG;
+  float weightB;
+};
+
+struct StaticProfileResources {
+  int32_t film = -1;
+  int32_t paper = -1;
+  bool cameraUvFilterEnabled = false;
+  float cameraUvCutNm = 410.0f;
+  bool cameraIrFilterEnabled = false;
+  float cameraIrCutNm = 675.0f;
+  const ProfileCurveSet *filmCurves = nullptr;
+  const ProfileCurveSet *paperCurves = nullptr;
+  KernelCurveInfo curveInfo{};
+  KernelCurveInfo paperCurveInfo{};
+  KernelColorInfo colorInfo{};
+  KernelSpectralInfo spectralInfo{};
+  id<MTLBuffer> curveInfoBuffer = nil;
+  id<MTLBuffer> logExposureBuffer = nil;
+  id<MTLBuffer> densityCurvesBuffer = nil;
+  id<MTLBuffer> spectralInfoBuffer = nil;
+  id<MTLBuffer> wavelengthsBuffer = nil;
+  id<MTLBuffer> logSensitivityBuffer = nil;
+  id<MTLBuffer> bandpassHanatosBuffer = nil;
+  id<MTLBuffer> hanatosRawResponseBuffer = nil;
+  id<MTLBuffer> mallettBasisIlluminantBuffer = nil;
+  id<MTLBuffer> inputToReferenceXyzBuffer = nil;
+  id<MTLBuffer> inputToSrgbBuffer = nil;
+  id<MTLBuffer> colorInfoBuffer = nil;
+  id<MTLBuffer> colorDecodeLutBuffer = nil;
+  id<MTLBuffer> colorTransferKindBuffer = nil;
+  id<MTLBuffer> paperCurveInfoBuffer = nil;
+  id<MTLBuffer> paperLogExposureBuffer = nil;
+  id<MTLBuffer> paperDensityCurvesBuffer = nil;
+  id<MTLBuffer> filmChannelDensityBuffer = nil;
+  id<MTLBuffer> filmBaseDensityBuffer = nil;
+  id<MTLBuffer> paperLogSensitivityBuffer = nil;
+  id<MTLBuffer> thKg3IlluminantBuffer = nil;
+  id<MTLBuffer> customEnlargerFiltersBuffer = nil;
+  id<MTLBuffer> neutralPrintFiltersBuffer = nil;
+  id<MTLBuffer> academyPrinterDensityDataBuffer = nil;
+  id<MTLBuffer> paperScanDensityDataBuffer = nil;
+  id<MTLBuffer> scanIlluminantsAndCmfsBuffer = nil;
+  id<MTLBuffer> scanToOutputRgbDataBuffer = nil;
+  id<MTLBuffer> colorEncodeLutBuffer = nil;
+
+  bool validFor(const RenderParams &params) const {
+    return film == params.film &&
+           paper == params.paper &&
+           cameraUvFilterEnabled == params.cameraUvFilterEnabled &&
+           cameraUvCutNm == params.cameraUvCutNm &&
+           cameraIrFilterEnabled == params.cameraIrFilterEnabled &&
+           cameraIrCutNm == params.cameraIrCutNm &&
+           filmCurves &&
+           paperCurves &&
+           curveInfoBuffer &&
+           logExposureBuffer &&
+           densityCurvesBuffer &&
+           spectralInfoBuffer &&
+           wavelengthsBuffer &&
+           logSensitivityBuffer &&
+           bandpassHanatosBuffer &&
+           hanatosRawResponseBuffer &&
+           mallettBasisIlluminantBuffer &&
+           inputToReferenceXyzBuffer &&
+           inputToSrgbBuffer &&
+           colorInfoBuffer &&
+           colorDecodeLutBuffer &&
+           colorTransferKindBuffer &&
+           paperCurveInfoBuffer &&
+           paperLogExposureBuffer &&
+           paperDensityCurvesBuffer &&
+           filmChannelDensityBuffer &&
+           filmBaseDensityBuffer &&
+           paperLogSensitivityBuffer &&
+           thKg3IlluminantBuffer &&
+           customEnlargerFiltersBuffer &&
+           neutralPrintFiltersBuffer &&
+           academyPrinterDensityDataBuffer &&
+           paperScanDensityDataBuffer &&
+           scanIlluminantsAndCmfsBuffer &&
+           scanToOutputRgbDataBuffer &&
+           colorEncodeLutBuffer;
+  }
+
+  void reset() {
+    film = -1;
+    paper = -1;
+    cameraUvFilterEnabled = false;
+    cameraUvCutNm = 410.0f;
+    cameraIrFilterEnabled = false;
+    cameraIrCutNm = 675.0f;
+    filmCurves = nullptr;
+    paperCurves = nullptr;
+    curveInfo = {};
+    paperCurveInfo = {};
+    colorInfo = {};
+    spectralInfo = {};
+    curveInfoBuffer = nil;
+    logExposureBuffer = nil;
+    densityCurvesBuffer = nil;
+    spectralInfoBuffer = nil;
+    wavelengthsBuffer = nil;
+    logSensitivityBuffer = nil;
+    bandpassHanatosBuffer = nil;
+    hanatosRawResponseBuffer = nil;
+    mallettBasisIlluminantBuffer = nil;
+    inputToReferenceXyzBuffer = nil;
+    inputToSrgbBuffer = nil;
+    colorInfoBuffer = nil;
+    colorDecodeLutBuffer = nil;
+    colorTransferKindBuffer = nil;
+    paperCurveInfoBuffer = nil;
+    paperLogExposureBuffer = nil;
+    paperDensityCurvesBuffer = nil;
+    filmChannelDensityBuffer = nil;
+    filmBaseDensityBuffer = nil;
+    paperLogSensitivityBuffer = nil;
+    thKg3IlluminantBuffer = nil;
+    customEnlargerFiltersBuffer = nil;
+    neutralPrintFiltersBuffer = nil;
+    academyPrinterDensityDataBuffer = nil;
+    paperScanDensityDataBuffer = nil;
+    scanIlluminantsAndCmfsBuffer = nil;
+    scanToOutputRgbDataBuffer = nil;
+    colorEncodeLutBuffer = nil;
+  }
+};
+
+float filmFormatMm(FilmFormat format) {
+  switch (format) {
+    case FilmFormat::Standard8:
+      return 4.8f;
+    case FilmFormat::Super8:
+      return 5.79f;
+    case FilmFormat::Standard16:
+      return 10.26f;
+    case FilmFormat::Super16:
+      return 12.52f;
+    case FilmFormat::Super35:
+      return 24.89f;
+    case FilmFormat::Standard65:
+      return 52.48f;
+    case FilmFormat::Imax70:
+      return 70.41f;
+    case FilmFormat::Standard35:
+    default:
+      return 35.0f;
+  }
+}
+
+float scannerSigmaUmFromMtf50(float mtf50LpMm) {
+  if (!std::isfinite(mtf50LpMm) || mtf50LpMm <= 0.0f) {
+    return 0.0f;
+  }
+  constexpr float kPi = 3.14159265358979323846f;
+  return 1000.0f * std::sqrt(std::log(2.0f) / (2.0f * kPi * kPi)) / mtf50LpMm;
+}
+
+uint32_t spektraHashCpu(uint32_t x) {
+  x ^= x >> 16u;
+  x *= 0x7feb352du;
+  x ^= x >> 15u;
+  x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+float spektraRand01Cpu(uint32_t seed) {
+  return (static_cast<float>(spektraHashCpu(seed) & 0x00ffffffu) + 0.5f) / 16777216.0f;
+}
+
+float wrapUnit(float value) {
+  return value - std::floor(value);
+}
+
+float radicalInverseBase2(uint32_t bits) {
+  bits = (bits << 16u) | (bits >> 16u);
+  bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xaaaaaaaau) >> 1u);
+  bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xccccccccu) >> 2u);
+  bits = ((bits & 0x0f0f0f0fu) << 4u) | ((bits & 0xf0f0f0f0u) >> 4u);
+  bits = ((bits & 0x00ff00ffu) << 8u) | ((bits & 0xff00ff00u) >> 8u);
+  return static_cast<float>(bits) * 2.3283064365386963e-10f;
+}
+
+float sobol2Y(uint32_t index) {
+  uint32_t x = 0u;
+  for (uint32_t bit = 0u; index != 0u; index >>= 1u, ++bit) {
+    if ((index & 1u) != 0u) {
+      x ^= 0x80000000u >> bit;
+      if (bit < 31u) {
+        x ^= 0x40000000u >> (bit + 1u);
+      }
+    }
+  }
+  return static_cast<float>(x) * 2.3283064365386963e-10f;
+}
+
+float minDistanceFromCenterCellToOffset(int offset, float cellSize) {
+  if (offset > 0) {
+    return static_cast<float>(offset - 1) * cellSize;
+  }
+  if (offset < 0) {
+    return static_cast<float>(-offset - 1) * cellSize;
+  }
+  return 0.0f;
+}
+
+float normalQuantile(float p) {
+  p = std::clamp(p, 1.0e-6f, 1.0f - 1.0e-6f);
+  constexpr float a1 = -3.969683028665376e+01f;
+  constexpr float a2 = 2.209460984245205e+02f;
+  constexpr float a3 = -2.759285104469687e+02f;
+  constexpr float a4 = 1.383577518672690e+02f;
+  constexpr float a5 = -3.066479806614716e+01f;
+  constexpr float a6 = 2.506628277459239e+00f;
+  constexpr float b1 = -5.447609879822406e+01f;
+  constexpr float b2 = 1.615858368580409e+02f;
+  constexpr float b3 = -1.556989798598866e+02f;
+  constexpr float b4 = 6.680131188771972e+01f;
+  constexpr float b5 = -1.328068155288572e+01f;
+  constexpr float c1 = -7.784894002430293e-03f;
+  constexpr float c2 = -3.223964580411365e-01f;
+  constexpr float c3 = -2.400758277161838e+00f;
+  constexpr float c4 = -2.549732539343734e+00f;
+  constexpr float c5 = 4.374664141464968e+00f;
+  constexpr float c6 = 2.938163982698783e+00f;
+  constexpr float d1 = 7.784695709041462e-03f;
+  constexpr float d2 = 3.224671290700398e-01f;
+  constexpr float d3 = 2.445134137142996e+00f;
+  constexpr float d4 = 3.754408661907416e+00f;
+  constexpr float pLow = 0.02425f;
+  constexpr float pHigh = 1.0f - pLow;
+  if (p < pLow) {
+    const float q = std::sqrt(-2.0f * std::log(p));
+    return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+      ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0f);
+  }
+  if (p > pHigh) {
+    const float q = std::sqrt(-2.0f * std::log(1.0f - p));
+    return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+      ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0f);
+  }
+  const float q = p - 0.5f;
+  const float r = q * q;
+  return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+    (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0f);
+}
+
+float grainSynthesisChannelScale(uint32_t channel, const KernelParams &params) {
+  return std::max(
+    channel == 0u ? params.grainSynthesisRadiusScaleR : (channel == 1u ? params.grainSynthesisRadiusScaleG : params.grainSynthesisRadiusScaleB),
+    1.0e-6f
+  );
+}
+
+float grainSynthesisLayerScale(uint32_t layer, const KernelParams &params) {
+  if (params.grainSynthesisLayered == 0u) {
+    return 1.0f;
+  }
+  return std::max(
+    layer == 0u ? params.grainSynthesisLayerScale0 : (layer == 1u ? params.grainSynthesisLayerScale1 : params.grainSynthesisLayerScale2),
+    1.0e-6f
+  );
+}
+
+void buildGrainSynthesisTables(
+  const KernelParams &params,
+  GrainSynthesisSamplerMode samplerMode,
+  uint32_t radiusLutSize,
+  GrainSynthesisCellMode cellMode,
+  std::array<KernelGrainSynthesisComponentInfo, kGrainSynthesisComponentCount> &componentInfo,
+  std::array<KernelGrainSynthesisSampleOffset, kGrainSynthesisComponentCount * kGrainSynthesisMaxSamples> &sampleOffsets,
+  std::vector<float> &radiusLut,
+  std::vector<KernelGrainSynthesisCellOffset> &cellOffsets
+) {
+  componentInfo = {};
+  sampleOffsets = {};
+  radiusLut.clear();
+  cellOffsets.clear();
+
+  constexpr float kPi = 3.14159265359f;
+  constexpr float kLn10 = 2.302585093f;
+  constexpr float kR2AlphaX = 0.7548776662466927f;
+  constexpr float kR2AlphaY = 0.5698402909980532f;
+  const uint32_t requestedSamples = static_cast<uint32_t>(std::clamp(params.grainSynthesisSamples, 1, static_cast<int32_t>(kGrainSynthesisMaxSamples)));
+  const float sigmaUm = std::max(params.grainSynthesisObservationSigmaUm, 0.0f);
+  const uint32_t sampleCount = sigmaUm <= 1.0e-6f ? 1u : requestedSamples;
+  const uint32_t frameSeed = params.grainAnimate != 0u
+    ? static_cast<uint32_t>(std::floor(params.time * 24.0f + 0.5f))
+    : 0u;
+
+  for (uint32_t component = 0u; component < kGrainSynthesisComponentCount; ++component) {
+    const uint32_t layer = component / 3u;
+    const uint32_t channel = component - layer * 3u;
+    KernelGrainSynthesisComponentInfo info{};
+    info.active = (params.grainSynthesisLayered != 0u || layer == 0u) ? 1u : 0u;
+    if (info.active == 0u) {
+      componentInfo[component] = info;
+      continue;
+    }
+
+    info.scaledMeanRadius = std::max(
+      params.grainSynthesisMeanRadiusUm *
+        grainSynthesisChannelScale(channel, params) *
+        grainSynthesisLayerScale(layer, params),
+      1.0e-6f
+    );
+    const float ratio = std::max(params.grainSynthesisRadiusStdDevRatio, 0.0f);
+    if (ratio <= 1.0e-6f) {
+      info.maxRadius = info.scaledMeanRadius;
+      info.logMean = std::log(std::max(info.scaledMeanRadius, 1.0e-6f));
+      info.logSigma = 0.0f;
+    } else {
+      info.logSigma = std::sqrt(std::log(1.0f + ratio * ratio));
+      info.logMean = std::log(std::max(info.scaledMeanRadius, 1.0e-6f)) - 0.5f * info.logSigma * info.logSigma;
+      info.maxRadius = std::max(
+        std::exp(info.logMean + info.logSigma * normalQuantile(params.grainSynthesisMaxRadiusQuantile)),
+        info.scaledMeanRadius
+      );
+    }
+    info.maxRadiusSquared = info.maxRadius * info.maxRadius;
+    info.cellSize = std::max(info.scaledMeanRadius * std::max(params.grainSynthesisCellSizeRatio, 0.05f), 1.0e-4f);
+    info.invCellSize = 1.0f / info.cellSize;
+    info.meanArea = kPi * info.scaledMeanRadius * info.scaledMeanRadius * (1.0f + ratio * ratio);
+    info.cellArea = info.cellSize * info.cellSize;
+    info.densityToLambda = kLn10 / std::max(info.meanArea, 1.0e-12f);
+    info.grainCap = static_cast<uint32_t>(std::clamp(params.grainSynthesisMaxGrainsPerCell, 1, 128));
+    info.cellScanRadius = std::max<uint32_t>(1u, static_cast<uint32_t>(std::ceil(info.maxRadius * info.invCellSize)));
+    info.sampleCount = sampleCount;
+    info.samplerMode = static_cast<uint32_t>(samplerMode);
+    if (radiusLutSize > 0u && info.logSigma > 1.0e-6f) {
+      info.radiusLutOffset = static_cast<uint32_t>(radiusLut.size());
+      info.radiusLutSize = std::min<uint32_t>(radiusLutSize, 512u);
+      radiusLut.reserve(radiusLut.size() + info.radiusLutSize);
+      for (uint32_t i = 0u; i < info.radiusLutSize; ++i) {
+        const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(info.radiusLutSize);
+        radiusLut.push_back(std::min(std::exp(info.logMean + info.logSigma * normalQuantile(u)), info.maxRadius));
+      }
+    }
+    if (cellMode != GrainSynthesisCellMode::Current) {
+      const int scanRadius = static_cast<int>(info.cellScanRadius);
+      const int side = scanRadius * 2 + 1;
+      if (side * side <= static_cast<int>(kGrainSynthesisMaxCellOffsetsPerComponent)) {
+        info.cellOffsetStart = static_cast<uint32_t>(cellOffsets.size());
+        for (int dy = -scanRadius; dy <= scanRadius; ++dy) {
+          for (int dx = -scanRadius; dx <= scanRadius; ++dx) {
+            const float minDx = minDistanceFromCenterCellToOffset(dx, info.cellSize);
+            const float minDy = minDistanceFromCenterCellToOffset(dy, info.cellSize);
+            if (minDx * minDx + minDy * minDy <= info.maxRadiusSquared) {
+              cellOffsets.push_back({dx, dy});
+            }
+          }
+        }
+        std::sort(cellOffsets.begin() + info.cellOffsetStart, cellOffsets.end(), [](const auto &a, const auto &b) {
+          const int da = a.x * a.x + a.y * a.y;
+          const int db = b.x * b.x + b.y * b.y;
+          return da < db;
+        });
+        info.cellOffsetCount = static_cast<uint32_t>(cellOffsets.size()) - info.cellOffsetStart;
+      }
+    }
+    componentInfo[component] = info;
+
+    const uint32_t seedBase = spektraHashCpu(
+      params.grainSeed ^ frameSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u)
+    );
+    const float shiftX = spektraRand01Cpu(seedBase ^ 0x23d3c1f1u);
+    const float shiftY = spektraRand01Cpu(seedBase ^ 0xa349b329u);
+    for (uint32_t sample = 0u; sample < sampleCount; ++sample) {
+      float u = 0.5f;
+      float v = 0.5f;
+      if (samplerMode == GrainSynthesisSamplerMode::SobolBlue) {
+        const uint32_t scrambleX = spektraHashCpu(seedBase ^ 0x68bc21ebu);
+        const uint32_t scrambleY = spektraHashCpu(seedBase ^ 0x02e5be93u);
+        u = wrapUnit(radicalInverseBase2(sample ^ scrambleX) + shiftX);
+        v = wrapUnit(sobol2Y(sample ^ scrambleY) + shiftY);
+      } else if (samplerMode == GrainSynthesisSamplerMode::Antithetic) {
+        const uint32_t pairIndex = sample / 2u;
+        u = wrapUnit(shiftX + (static_cast<float>(pairIndex) + 0.5f) * kR2AlphaX);
+        v = wrapUnit(shiftY + (static_cast<float>(pairIndex) + 0.5f) * kR2AlphaY);
+      } else {
+        u = wrapUnit(shiftX + (static_cast<float>(sample) + 0.5f) * kR2AlphaX);
+        v = wrapUnit(shiftY + (static_cast<float>(sample) + 0.5f) * kR2AlphaY);
+      }
+      KernelGrainSynthesisSampleOffset &offset = sampleOffsets[component * kGrainSynthesisMaxSamples + sample];
+      offset.x = normalQuantile(u) * sigmaUm;
+      offset.y = normalQuantile(v) * sigmaUm;
+      if (samplerMode == GrainSynthesisSamplerMode::Antithetic && (sample & 1u) != 0u) {
+        offset.x = -offset.x;
+        offset.y = -offset.y;
+      }
+    }
+  }
+}
+
+float filmPushPullGamma(float stops) {
+  const float clampedStops = std::clamp(stops, -2.0f, 2.0f);
+  constexpr float kNormalEcn2Seconds = 180.0f;
+  constexpr float kPull1Seconds = 150.0f;
+  constexpr float kPush1Seconds = 220.0f;
+  constexpr float kPush2Seconds = 280.0f;
+  if (clampedStops < 0.0f) {
+    return std::pow(kPull1Seconds / kNormalEcn2Seconds, -clampedStops);
+  }
+  if (clampedStops <= 1.0f) {
+    return std::exp(std::log(kPush1Seconds / kNormalEcn2Seconds) * clampedStops);
+  }
+  const float segment = clampedStops - 1.0f;
+  return std::exp(
+    std::log(kPush1Seconds / kNormalEcn2Seconds) +
+    std::log(kPush2Seconds / kPush1Seconds) * segment
+  );
+}
+
+float printPushPullGamma(float stops) {
+  const float clampedStops = std::clamp(stops, -2.0f, 2.0f);
+  return std::exp2(clampedStops * 0.25f);
+}
+
+float enlargerScale(const RenderParams &params) {
+  return std::clamp(params.enlargerScale, 1.0f, 32.0f);
+}
+
+bool enlargerTransformActive(const RenderParams &params) {
+  return std::abs(enlargerScale(params) - 1.0f) > 1.0e-6f;
+}
+
+KernelParams toKernelParams(const RenderParams &params, double time, int32_t width, int32_t height) {
+  KernelParams out{};
+  out.process = static_cast<int32_t>(params.process);
+  out.rgbToRawMethod = static_cast<int32_t>(params.rgbToRawMethod);
+  out.inputColorSpace = static_cast<int32_t>(params.inputColorSpace);
+  out.outputColorSpace = static_cast<int32_t>(params.outputColorSpace);
+  out.outputRole = static_cast<int32_t>(params.outputRole);
+  out.hdrPreset = static_cast<int32_t>(params.hdrPreset);
+  out.hdrTransfer = static_cast<int32_t>(params.hdrTransfer);
+  out.hdrReferenceWhiteNits = params.hdrReferenceWhiteNits;
+  out.hdrPeakNits = params.hdrPeakNits;
+  out.hdrExposureEv = params.hdrExposureEv;
+  out.hdrToneMapping = static_cast<int32_t>(params.hdrToneMapping);
+  out.film = params.film;
+  out.paper = params.paper;
+  out.printTiming = static_cast<int32_t>(params.printTiming);
+  out.filmExposureEv = params.filmExposureEv;
+  out.autoExposureEnabled = params.autoExposure ? 1u : 0u;
+  out.autoExposureMethod = static_cast<int32_t>(params.autoExposureMethod);
+  out.autoExposureEv = 0.0f;
+  out.printExposureEv = params.printExposureEv;
+  out.filmPushPullMode = static_cast<int32_t>(params.filmPushPullMode);
+  out.filmPushPullStops = params.filmPushPullStops;
+  out.printPushPullMode = 0;
+  out.printPushPullStops = params.printPushPullStops;
+  out.negativeBleachBypassAmount = params.negativeBleachBypassAmount;
+  out.negativeLeucoCyanCoupling = params.negativeLeucoCyanCoupling;
+  out.printBleachBypassAmount = params.printBleachBypassAmount;
+  out.filmGamma = params.filmPushPullMode == PushPullMode::Experimental
+    ? params.filmGamma
+    : params.filmGamma * filmPushPullGamma(params.filmPushPullStops);
+  out.printGamma = params.printGamma * printPushPullGamma(params.printPushPullStops);
+  out.printShadowShape = params.printShadowShape;
+  out.printHighlightShape = params.printHighlightShape;
+  out.filterC = params.filterC;
+  out.filterMShift = params.filterMShift;
+  out.filterYShift = params.filterYShift;
+  out.enlargerScale = enlargerScale(params);
+  out.enlargerOffsetXPercent = params.enlargerOffsetXPercent;
+  out.enlargerOffsetYPercent = params.enlargerOffsetYPercent;
+  out.preflashExposure = params.preflashExposure;
+  out.preflashMFilterShift = params.preflashMFilterShift;
+  out.preflashYFilterShift = params.preflashYFilterShift;
+  out.printerLightsR = params.printerLightsR;
+  out.printerLightsG = params.printerLightsG;
+  out.printerLightsB = params.printerLightsB;
+  out.printerLightsGang = params.printerLightsGang ? 1u : 0u;
+  out.printerLightCalibration = params.printerLightCalibration ? 1u : 0u;
+  out.dirCouplersAmount = params.dirCouplersAmount;
+  out.dirCouplersDiffusionUm = params.dirCouplersDiffusionUm;
+  out.grainEnabled = params.grainEnabled ? 1u : 0u;
+  out.grainModel = static_cast<int32_t>(params.grainModel);
+  out.filmFormat = static_cast<int32_t>(params.filmFormat);
+  out.grainSublayersEnabled = params.grainSublayersEnabled ? 1u : 0u;
+  out.grainSubLayerCount = std::max(1, params.grainSubLayerCount);
+  out.grainParticleAreaUm2 = params.grainParticleAreaUm2;
+  out.grainParticleScaleR = params.grainParticleScaleR;
+  out.grainParticleScaleG = params.grainParticleScaleG;
+  out.grainParticleScaleB = params.grainParticleScaleB;
+  out.grainParticleScaleLayer0 = params.grainParticleScaleLayer0;
+  out.grainParticleScaleLayer1 = params.grainParticleScaleLayer1;
+  out.grainParticleScaleLayer2 = params.grainParticleScaleLayer2;
+  out.grainDensityMinR = params.grainDensityMinR;
+  out.grainDensityMinG = params.grainDensityMinG;
+  out.grainDensityMinB = params.grainDensityMinB;
+  out.grainUniformityR = params.grainUniformityR;
+  out.grainUniformityG = params.grainUniformityG;
+  out.grainUniformityB = params.grainUniformityB;
+  out.grainFinalBlurUm = params.grainFinalBlurUm;
+  out.grainBlurDyeCloudsUm = params.grainBlurDyeCloudsUm;
+  out.grainMicroStructureScale = params.grainMicroStructureScale;
+  out.grainMicroStructureSigmaNm = params.grainMicroStructureSigmaNm;
+  out.grainSeed = params.grainSeed;
+  out.grainAnimate = params.grainAnimate ? 1u : 0u;
+  const int32_t filmReferencePixels = std::max(width, height);
+  out.filmPixelSizeUm = filmFormatMm(params.filmFormat) * 1000.0f /
+    static_cast<float>(std::max(filmReferencePixels, 1)) / out.enlargerScale;
+  const float grainSynthesisQuality = std::clamp(params.grainSynthesisQuality, 0.25f, 4.0f);
+  const float grainSynthesisSize = std::clamp(params.grainSynthesisSize, 0.25f, 4.0f);
+  const float grainSynthesisSharpness = std::max(params.grainSynthesisSharpness, 0.25f);
+  out.grainSynthesisSamples = std::clamp(
+    static_cast<int32_t>(std::lround(static_cast<float>(params.grainSynthesisSamples) * grainSynthesisQuality)),
+    1,
+    1024
+  );
+  out.grainSynthesisAmount = std::clamp(params.grainSynthesisAmount, 0.0f, 3.0f);
+  out.grainSynthesisMeanRadiusUm = params.grainSynthesisMeanRadiusUm * grainSynthesisSize;
+  out.grainSynthesisRadiusStdDevRatio = params.grainSynthesisRadiusStdDevRatio;
+  out.grainSynthesisObservationSigmaUm = params.grainSynthesisObservationSigmaUm / grainSynthesisSharpness;
+  out.grainSynthesisCellSizeRatio = params.grainSynthesisCellSizeRatio;
+  out.grainSynthesisMaxRadiusQuantile = params.grainSynthesisMaxRadiusQuantile;
+  out.grainSynthesisCoverageEpsilon = params.grainSynthesisCoverageEpsilon;
+  out.grainSynthesisMaxGrainsPerCell = std::clamp(params.grainSynthesisMaxGrainsPerCell, 1, 128);
+  out.grainSynthesisRadiusScaleR = params.grainSynthesisRadiusScaleR;
+  out.grainSynthesisRadiusScaleG = params.grainSynthesisRadiusScaleG;
+  out.grainSynthesisRadiusScaleB = params.grainSynthesisRadiusScaleB;
+  out.grainSynthesisLayerScale0 = params.grainSynthesisLayerScale0;
+  out.grainSynthesisLayerScale1 = params.grainSynthesisLayerScale1;
+  out.grainSynthesisLayerScale2 = params.grainSynthesisLayerScale2;
+  out.grainSynthesisLayered = params.grainSynthesisLayered ? 1u : 0u;
+  out.halationEnabled = params.halationEnabled ? 1u : 0u;
+  out.scatterAmount = params.scatterAmount;
+  out.scatterScale = params.scatterScale;
+  out.halationAmount = params.halationAmount;
+  out.halationScale = params.halationScale;
+  out.halationStrengthR = params.halationStrengthR;
+  out.halationStrengthG = params.halationStrengthG;
+  out.halationStrengthB = params.halationStrengthB;
+  out.halationFirstSigmaUmR = params.halationFirstSigmaUmR;
+  out.halationFirstSigmaUmG = params.halationFirstSigmaUmG;
+  out.halationFirstSigmaUmB = params.halationFirstSigmaUmB;
+  out.cameraDiffusionEnabled = params.cameraDiffusionEnabled ? 1u : 0u;
+  out.cameraDiffusionFamily = static_cast<int32_t>(params.cameraDiffusionFamily);
+  out.cameraDiffusionStrength = params.cameraDiffusionStrength;
+  out.cameraDiffusionSpatialScale = params.cameraDiffusionSpatialScale;
+  out.cameraDiffusionHaloWarmth = params.cameraDiffusionHaloWarmth;
+  out.cameraDiffusionCoreIntensity = params.cameraDiffusionCoreIntensity;
+  out.cameraDiffusionCoreSize = params.cameraDiffusionCoreSize;
+  out.cameraDiffusionHaloIntensity = params.cameraDiffusionHaloIntensity;
+  out.cameraDiffusionHaloSize = params.cameraDiffusionHaloSize;
+  out.cameraDiffusionBloomIntensity = params.cameraDiffusionBloomIntensity;
+  out.cameraDiffusionBloomSize = params.cameraDiffusionBloomSize;
+  out.printDiffusionEnabled = params.printDiffusionEnabled ? 1u : 0u;
+  out.printDiffusionFamily = static_cast<int32_t>(params.printDiffusionFamily);
+  out.printDiffusionStrength = params.printDiffusionStrength;
+  out.printDiffusionSpatialScale = params.printDiffusionSpatialScale;
+  out.printDiffusionHaloWarmth = params.printDiffusionHaloWarmth;
+  out.printDiffusionCoreIntensity = params.printDiffusionCoreIntensity;
+  out.printDiffusionCoreSize = params.printDiffusionCoreSize;
+  out.printDiffusionHaloIntensity = params.printDiffusionHaloIntensity;
+  out.printDiffusionHaloSize = params.printDiffusionHaloSize;
+  out.printDiffusionBloomIntensity = params.printDiffusionBloomIntensity;
+  out.printDiffusionBloomSize = params.printDiffusionBloomSize;
+  out.scannerEnabled = params.scannerEnabled ? 1u : 0u;
+  out.scannerWhiteCorrection = params.scannerWhiteCorrection ? 1u : 0u;
+  out.scannerBlackCorrection = params.scannerBlackCorrection ? 1u : 0u;
+  out.scannerWhiteLevel = params.scannerWhiteLevel;
+  out.scannerBlackLevel = params.scannerBlackLevel;
+  out.glarePercent = params.glarePercent;
+  out.scannerBlurSigmaPx = scannerSigmaUmFromMtf50(params.scannerMtf50LpMm) / std::max(out.filmPixelSizeUm, 1.0e-6f);
+  out.scannerUnsharpSigmaPx = std::max(params.scannerUnsharpRadiusUm, 0.0f) / std::max(out.filmPixelSizeUm, 1.0e-6f);
+  out.scannerUnsharpAmount = params.scannerUnsharpAmount;
+  out.time = static_cast<float>(time);
+  return out;
+}
+
+bool isDefaultHalationStrength(const RenderParams &params) {
+  return std::abs(params.halationStrengthR - 0.05f) <= 1.0e-6f &&
+         std::abs(params.halationStrengthG - 0.015f) <= 1.0e-6f &&
+         std::abs(params.halationStrengthB) <= 1.0e-6f;
+}
+
+void applyProfileHalationDefaults(KernelParams &kernelParams, const RenderParams &params, const ProfileCurveSet &filmCurves) {
+  if (filmCurves.halationFirstSigmaUm) {
+    kernelParams.halationFirstSigmaUmR = filmCurves.halationFirstSigmaUm[0];
+    kernelParams.halationFirstSigmaUmG = filmCurves.halationFirstSigmaUm[1];
+    kernelParams.halationFirstSigmaUmB = filmCurves.halationFirstSigmaUm[2];
+  }
+  if (filmCurves.halationStrength && isDefaultHalationStrength(params)) {
+    kernelParams.halationStrengthR = filmCurves.halationStrength[0];
+    kernelParams.halationStrengthG = filmCurves.halationStrength[1];
+    kernelParams.halationStrengthB = filmCurves.halationStrength[2];
+  }
+}
+
+struct DiffusionGroup {
+  float lambdaUm;
+  float spread;
+  uint32_t count;
+  float alpha;
+};
+
+struct DiffusionFamilyShape {
+  DiffusionGroup core;
+  DiffusionGroup halo;
+  DiffusionGroup bloom;
+  float weightCore;
+  float weightHalo;
+  float weightBloom;
+  float warmthBase;
+  float totalGain;
+};
+
+struct DiffusionSettings {
+  DiffusionFilterFamily family = DiffusionFilterFamily::BlackProMist;
+  float strength = 0.5f;
+  float spatialScale = 1.0f;
+  float haloWarmth = 0.0f;
+  float coreIntensity = 1.0f;
+  float coreSize = 1.0f;
+  float haloIntensity = 1.0f;
+  float haloSize = 1.0f;
+  float bloomIntensity = 1.0f;
+  float bloomSize = 1.0f;
+};
+
+DiffusionFamilyShape diffusionShape(DiffusionFilterFamily family) {
+  switch (family) {
+    case DiffusionFilterFamily::Glimmerglass:
+      return {{10.0f, 1.5f, 2u, 3.0f}, {50.0f, 2.0f, 3u, 3.0f}, {260.0f, 2.5f, 4u, 3.2f}, 0.60f, 0.30f, 0.10f, 0.0f, 0.65f};
+    case DiffusionFilterFamily::ProMist:
+      return {{14.0f, 1.5f, 2u, 3.0f}, {150.0f, 2.0f, 3u, 3.0f}, {650.0f, 2.5f, 4u, 2.9f}, 0.28f, 0.42f, 0.30f, 0.40f, 1.05f};
+    case DiffusionFilterFamily::CineBloom:
+      return {{20.0f, 1.5f, 2u, 3.0f}, {200.0f, 2.0f, 3u, 3.0f}, {1000.0f, 2.5f, 4u, 2.5f}, 0.22f, 0.30f, 0.48f, 0.85f, 1.00f};
+    case DiffusionFilterFamily::BlackProMist:
+    default:
+      return {{16.0f, 1.5f, 2u, 3.0f}, {95.0f, 2.0f, 3u, 3.0f}, {380.0f, 2.5f, 4u, 3.5f}, 0.40f, 0.47f, 0.13f, 0.65f, 0.75f};
+  }
+}
+
+float diffusionScatterFraction(float strength, float familyGain) {
+  if (strength <= 0.0f) {
+    return 0.0f;
+  }
+  constexpr std::array<float, 5> kBreaks = {0.125f, 0.25f, 0.5f, 1.0f, 2.0f};
+  constexpr std::array<float, 5> kFractions = {0.10f, 0.20f, 0.35f, 0.55f, 0.75f};
+  const float logStrength = std::log2(std::max(strength, 1.0e-6f));
+  if (logStrength <= std::log2(kBreaks.front())) {
+    return std::clamp(kFractions.front() * familyGain, 0.0f, 0.99f);
+  }
+  if (logStrength >= std::log2(kBreaks.back())) {
+    return std::clamp(kFractions.back() * familyGain, 0.0f, 0.99f);
+  }
+  for (size_t i = 0; i + 1u < kBreaks.size(); ++i) {
+    const float x0 = std::log2(kBreaks[i]);
+    const float x1 = std::log2(kBreaks[i + 1u]);
+    if (logStrength >= x0 && logStrength <= x1) {
+      const float t = std::clamp((logStrength - x0) / std::max(x1 - x0, 1.0e-6f), 0.0f, 1.0f);
+      return std::clamp((kFractions[i] + (kFractions[i + 1u] - kFractions[i]) * t) * familyGain, 0.0f, 0.99f);
+    }
+  }
+  return 0.0f;
+}
+
+std::vector<float> diffusionLambdas(const DiffusionGroup &group) {
+  std::vector<float> lambdas(group.count, group.lambdaUm);
+  if (group.count <= 1u || group.spread <= 1.0f) {
+    return lambdas;
+  }
+  const float logLo = std::log(group.lambdaUm / group.spread);
+  const float logHi = std::log(group.lambdaUm * group.spread);
+  for (uint32_t i = 0; i < group.count; ++i) {
+    const float t = group.count == 1u ? 0.0f : static_cast<float>(i) / static_cast<float>(group.count - 1u);
+    lambdas[i] = std::exp(logLo + (logHi - logLo) * t);
+  }
+  return lambdas;
+}
+
+std::vector<float> diffusionWeights(const DiffusionGroup &group, bool bloom) {
+  const std::vector<float> lambdas = diffusionLambdas(group);
+  std::vector<float> weights(lambdas.size(), 1.0f);
+  if (bloom) {
+    for (size_t i = 0; i < weights.size(); ++i) {
+      weights[i] = std::pow(std::max(lambdas[i], 1.0e-6f), 2.0f - group.alpha);
+    }
+  }
+  float sum = 0.0f;
+  for (float weight : weights) {
+    sum += weight;
+  }
+  for (float &weight : weights) {
+    weight /= std::max(sum, 1.0e-6f);
+  }
+  return weights;
+}
+
+std::array<std::vector<float>, 3> haloChannelWeights(const std::vector<float> &weights, float warmth) {
+  constexpr std::array<float, 3> kWarmthAxis = {1.30f, 0.15f, -1.45f};
+  std::array<std::vector<float>, 3> out;
+  const size_t count = weights.size();
+  for (auto &channel : out) {
+    channel = weights;
+  }
+  if (count < 2u) {
+    return out;
+  }
+  warmth = std::clamp(warmth, -1.5f, 1.5f);
+  std::vector<float> gradient(count, 0.0f);
+  float totalWeight = 0.0f;
+  float weightedGradient = 0.0f;
+  for (size_t i = 0; i < count; ++i) {
+    gradient[i] = -1.0f + 2.0f * static_cast<float>(i) / static_cast<float>(count - 1u);
+    totalWeight += weights[i];
+    weightedGradient += weights[i] * gradient[i];
+  }
+  const float gradientMean = weightedGradient / std::max(totalWeight, 1.0e-6f);
+  for (size_t i = 0; i < count; ++i) {
+    gradient[i] -= gradientMean;
+  }
+  for (size_t channel = 0; channel < 3u; ++channel) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+      out[channel][i] = std::max(weights[i] * (1.0f + warmth * kWarmthAxis[channel] * gradient[i]), 0.0f);
+      sum += out[channel][i];
+    }
+    for (size_t i = 0; i < count; ++i) {
+      out[channel][i] *= totalWeight / std::max(sum, 1.0e-6f);
+    }
+  }
+  return out;
+}
+
+void appendDiffusionGroupComponents(
+  std::vector<KernelDiffusionComponent> &components,
+  const DiffusionGroup &group,
+  const std::vector<float> &weights,
+  const std::array<float, 3> &channelScale,
+  float groupWeight,
+  float spatialScale,
+  float pixelSizeUm
+) {
+  constexpr std::array<std::array<float, 2>, 3> kExpGaussianFit = {{
+    {0.1633f, 0.5360f},
+    {0.6496f, 1.5236f},
+    {0.1870f, 2.7684f},
+  }};
+  const std::vector<float> lambdas = diffusionLambdas(group);
+  for (size_t i = 0; i < lambdas.size(); ++i) {
+    for (const auto &fit : kExpGaussianFit) {
+      const float sigmaPx = std::max(lambdas[i] * fit[1] * spatialScale / std::max(pixelSizeUm, 1.0e-6f), 1.0e-6f);
+      const float weight = groupWeight * weights[i] * fit[0];
+      const float weightR = weight * channelScale[0];
+      const float weightG = weight * channelScale[1];
+      const float weightB = weight * channelScale[2];
+      if (weightR == 0.0f && weightG == 0.0f && weightB == 0.0f) {
+        continue;
+      }
+      components.push_back({
+        sigmaPx,
+        weightR,
+        weightG,
+        weightB,
+      });
+    }
+  }
+}
+
+std::vector<KernelDiffusionComponent> makeDiffusionComponents(
+  const DiffusionSettings &settings,
+  float pixelSizeUm,
+  KernelDiffusionInfo &info
+) {
+  DiffusionFamilyShape shape = diffusionShape(settings.family);
+  const float coreIntensity = std::max(settings.coreIntensity, 0.0f);
+  const float haloIntensity = std::max(settings.haloIntensity, 0.0f);
+  const float bloomIntensity = std::max(settings.bloomIntensity, 0.0f);
+  float wc = shape.weightCore * coreIntensity;
+  float wh = shape.weightHalo * haloIntensity;
+  float wb = shape.weightBloom * bloomIntensity;
+  const float total = wc + wh + wb;
+  if (total > 0.0f) {
+    wc /= total;
+    wh /= total;
+    wb /= total;
+  } else {
+    info.scatterFraction = 0.0f;
+    info.componentCount = 0u;
+    return {};
+  }
+  shape.core.lambdaUm *= std::max(settings.coreSize, 1.0e-6f);
+  shape.halo.lambdaUm *= std::max(settings.haloSize, 1.0e-6f);
+  shape.bloom.lambdaUm *= std::max(settings.bloomSize, 1.0e-6f);
+
+  info.scatterFraction = diffusionScatterFraction(settings.strength, shape.totalGain);
+  std::vector<KernelDiffusionComponent> components;
+  if (info.scatterFraction <= 0.0f || settings.spatialScale <= 0.0f) {
+    info.componentCount = 0u;
+    return components;
+  }
+
+  appendDiffusionGroupComponents(
+    components,
+    shape.core,
+    diffusionWeights(shape.core, false),
+    {1.0f, 1.0f, 1.0f},
+    wc,
+    settings.spatialScale,
+    pixelSizeUm
+  );
+
+  const std::vector<float> haloWeights = diffusionWeights(shape.halo, false);
+  const auto haloPerChannel = haloChannelWeights(haloWeights, shape.warmthBase + settings.haloWarmth);
+  const std::vector<float> haloLambdas = diffusionLambdas(shape.halo);
+  constexpr std::array<std::array<float, 2>, 3> kExpGaussianFit = {{
+    {0.1633f, 0.5360f},
+    {0.6496f, 1.5236f},
+    {0.1870f, 2.7684f},
+  }};
+  for (size_t i = 0; i < haloLambdas.size(); ++i) {
+    for (const auto &fit : kExpGaussianFit) {
+      const float sigmaPx = std::max(haloLambdas[i] * fit[1] * settings.spatialScale / std::max(pixelSizeUm, 1.0e-6f), 1.0e-6f);
+      const float weightR = wh * haloPerChannel[0][i] * fit[0];
+      const float weightG = wh * haloPerChannel[1][i] * fit[0];
+      const float weightB = wh * haloPerChannel[2][i] * fit[0];
+      if (weightR == 0.0f && weightG == 0.0f && weightB == 0.0f) {
+        continue;
+      }
+      components.push_back({
+        sigmaPx,
+        weightR,
+        weightG,
+        weightB,
+      });
+    }
+  }
+
+  appendDiffusionGroupComponents(
+    components,
+    shape.bloom,
+    diffusionWeights(shape.bloom, true),
+    {1.0f, 1.0f, 1.0f},
+    wb,
+    settings.spatialScale,
+    pixelSizeUm
+  );
+
+  info.componentCount = static_cast<uint32_t>(components.size());
+  return components;
+}
+
+const ProfileCurveSet *selectedFilmCurves(const RenderParams &params) {
+  const ProfileCurveSet *curves = filmProfileCurves(params.film);
+  return curves ? curves : filmProfileCurves(static_cast<int32_t>(kSpektraDefaultFilmIndex));
+}
+
+const ProfileCurveSet *selectedPaperCurves(const RenderParams &params) {
+  const ProfileCurveSet *curves = paperProfileCurves(params.paper);
+  return curves ? curves : paperProfileCurves(static_cast<int32_t>(kSpektraDefaultPaperIndex));
+}
+
+std::vector<float> makeLinearSensitivity(const float *logSensitivity, uint32_t wavelengthCount) {
+  std::vector<float> linear(static_cast<size_t>(wavelengthCount) * 3u, 0.0f);
+  if (!logSensitivity) {
+    return linear;
+  }
+  for (uint32_t i = 0; i < wavelengthCount * 3u; ++i) {
+    const float value = std::pow(10.0f, logSensitivity[i]);
+    linear[i] = std::isfinite(value) ? value : 0.0f;
+  }
+  return linear;
+}
+
+float smoothErfEdge(float wavelength, float center, float width) {
+  return std::erf((wavelength - center) / width) * 0.5f + 0.5f;
+}
+
+std::vector<float> applyCameraBandPass(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &linearSensitivity,
+  const RenderParams &params
+) {
+  std::vector<float> filtered = linearSensitivity;
+  if (!filmCurves.wavelengths ||
+      filtered.size() < static_cast<size_t>(filmCurves.wavelengthCount) * 3u ||
+      (!params.cameraUvFilterEnabled && !params.cameraIrFilterEnabled)) {
+    return filtered;
+  }
+
+  constexpr float kPythonUvTransitionNm = 8.0f;
+  constexpr float kPythonIrTransitionNm = 15.0f;
+  for (uint32_t wavelength = 0; wavelength < filmCurves.wavelengthCount; ++wavelength) {
+    const float wl = filmCurves.wavelengths[wavelength];
+    const float uvTransmission = params.cameraUvFilterEnabled
+      ? smoothErfEdge(wl, params.cameraUvCutNm, kPythonUvTransitionNm)
+      : 1.0f;
+    const float irTransmission = params.cameraIrFilterEnabled
+      ? smoothErfEdge(wl, params.cameraIrCutNm, -kPythonIrTransitionNm)
+      : 1.0f;
+    const float transmission = uvTransmission * irTransmission;
+    const uint32_t offset = wavelength * 3u;
+    filtered[offset] *= transmission;
+    filtered[offset + 1u] *= transmission;
+    filtered[offset + 2u] *= transmission;
+  }
+  return filtered;
+}
+
+std::array<float, 9> makeMallettRawMatrixUnnormalized(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &linearSensitivity
+) {
+  std::array<float, 9> matrix{};
+  const uint32_t wavelengthCount = filmCurves.wavelengthCount;
+  if (!filmCurves.mallettBasisIlluminant || linearSensitivity.size() < static_cast<size_t>(wavelengthCount) * 3u) {
+    return matrix;
+  }
+  for (uint32_t wavelength = 0; wavelength < wavelengthCount; ++wavelength) {
+    const uint32_t offset = wavelength * 3u;
+    for (uint32_t outChannel = 0; outChannel < 3u; ++outChannel) {
+      for (uint32_t inChannel = 0; inChannel < 3u; ++inChannel) {
+        matrix[outChannel * 3u + inChannel] +=
+          linearSensitivity[offset + outChannel] * filmCurves.mallettBasisIlluminant[offset + inChannel];
+      }
+    }
+  }
+  return matrix;
+}
+
+std::array<float, 9> makeMallettRawMatrix(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &linearSensitivity,
+  const std::vector<float> &unfilteredLinearSensitivity,
+  bool cameraFilterActive
+) {
+  std::array<float, 9> matrix = makeMallettRawMatrixUnnormalized(filmCurves, linearSensitivity);
+  float normalization = std::max(filmCurves.mallettRawMidgrayGreen, 1.0e-10f);
+  if (cameraFilterActive) {
+    const std::array<float, 9> unfilteredMatrix =
+      makeMallettRawMatrixUnnormalized(filmCurves, unfilteredLinearSensitivity);
+    constexpr float kMidgray = 0.184f;
+    const float filteredGreenMidgrayProxy = kMidgray * (matrix[3] + matrix[4] + matrix[5]);
+    const float unfilteredGreenMidgrayProxy = kMidgray * (unfilteredMatrix[3] + unfilteredMatrix[4] + unfilteredMatrix[5]);
+    normalization *= filteredGreenMidgrayProxy / std::max(unfilteredGreenMidgrayProxy, 1.0e-10f);
+  }
+  normalization = std::max(normalization, 1.0e-10f);
+  for (float &value : matrix) {
+    value /= normalization;
+  }
+  return matrix;
+}
+
+std::vector<float> makeHanatosRawResponse(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &linearSensitivity,
+  const std::vector<float> &hanatosSpectra,
+  const HanatosSpectraLutInfo &hanatos
+) {
+  const size_t responseCount = static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * 3u;
+  std::vector<float> response(responseCount, 0.0f);
+  const size_t expectedSpectra = static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * static_cast<size_t>(hanatos.wavelengthCount);
+  if (!filmCurves.bandpassHanatos2025 ||
+      hanatos.width == 0 ||
+      hanatos.height == 0 ||
+      hanatos.wavelengthCount == 0 ||
+      hanatosSpectra.size() < expectedSpectra ||
+      linearSensitivity.size() < static_cast<size_t>(hanatos.wavelengthCount) * 3u) {
+    return response;
+  }
+
+  for (uint32_t x = 0; x < hanatos.width; ++x) {
+    for (uint32_t y = 0; y < hanatos.height; ++y) {
+      float raw[3] = {0.0f, 0.0f, 0.0f};
+      const size_t spectraOffset = (static_cast<size_t>(x) * hanatos.height + y) * hanatos.wavelengthCount;
+      for (uint32_t wavelength = 0; wavelength < hanatos.wavelengthCount; ++wavelength) {
+        const float spectrum = hanatosSpectra[spectraOffset + wavelength];
+        const uint32_t sensitivityOffset = wavelength * 3u;
+        raw[0] += spectrum * linearSensitivity[sensitivityOffset] * filmCurves.bandpassHanatos2025[sensitivityOffset];
+        raw[1] += spectrum * linearSensitivity[sensitivityOffset + 1u] * filmCurves.bandpassHanatos2025[sensitivityOffset + 1u];
+        raw[2] += spectrum * linearSensitivity[sensitivityOffset + 2u] * filmCurves.bandpassHanatos2025[sensitivityOffset + 2u];
+      }
+      const size_t responseOffset = (static_cast<size_t>(x) * hanatos.height + y) * 3u;
+      response[responseOffset] = raw[0];
+      response[responseOffset + 1u] = raw[1];
+      response[responseOffset + 2u] = raw[2];
+    }
+  }
+  return response;
+}
+
+float interpLinear(const std::vector<float> &x, const float *y, uint32_t channel, float target) {
+  if (x.empty()) {
+    return 0.0f;
+  }
+  const bool ascending = x.back() >= x.front();
+  if ((ascending && target <= x.front()) || (!ascending && target >= x.front())) {
+    const float value = y[channel];
+    return value;
+  }
+  if ((ascending && target >= x.back()) || (!ascending && target <= x.back())) {
+    const float value = y[(x.size() - 1u) * 3u + channel];
+    return value;
+  }
+  uint32_t lo = 0;
+  uint32_t hi = static_cast<uint32_t>(x.size() - 1u);
+  while (hi - lo > 1u) {
+    const uint32_t mid = (lo + hi) >> 1u;
+    if ((ascending && x[mid] <= target) || (!ascending && x[mid] >= target)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const float denom = std::max(std::abs(x[hi] - x[lo]), 1.0e-9f);
+  const float t = std::clamp((target - x[lo]) / denom, 0.0f, 1.0f);
+  const float y0 = y[lo * 3u + channel];
+  const float y1 = y[hi * 3u + channel];
+  const float value = y0 + (y1 - y0) * t;
+  return value;
+}
+
+KernelDirInfo makeDirInfo(const ProfileCurveSet &filmCurves, const RenderParams &params) {
+  const float amount = std::max(params.dirCouplersAmount, 0.0f);
+  const float sameLayer = std::max(params.dirCouplersInhibitionSameLayer, 0.0f);
+  const float interlayer = std::max(params.dirCouplersInhibitionInterlayer, 0.0f);
+  KernelDirInfo info{};
+  info.matrix00 = params.dirCouplersGammaSameLayerR * sameLayer * amount;
+  info.matrix11 = params.dirCouplersGammaSameLayerG * sameLayer * amount;
+  info.matrix22 = params.dirCouplersGammaSameLayerB * sameLayer * amount;
+  info.matrix01 = params.dirCouplersGammaRToG * interlayer * amount;
+  info.matrix02 = params.dirCouplersGammaRToB * interlayer * amount;
+  info.matrix10 = params.dirCouplersGammaGToR * interlayer * amount;
+  info.matrix12 = params.dirCouplersGammaGToB * interlayer * amount;
+  info.matrix20 = params.dirCouplersGammaBToR * interlayer * amount;
+  info.matrix21 = params.dirCouplersGammaBToG * interlayer * amount;
+  for (uint32_t channel = 0; channel < 3u; ++channel) {
+    float maximum = 0.0f;
+    for (uint32_t i = 0; i < filmCurves.exposureCount; ++i) {
+      maximum = std::max(maximum, filmCurves.densityCurves[i * 3u + channel]);
+    }
+    if (channel == 0u) {
+      info.densityMax0 = maximum;
+    } else if (channel == 1u) {
+      info.densityMax1 = maximum;
+    } else {
+      info.densityMax2 = maximum;
+    }
+  }
+  return info;
+}
+
+std::array<float, 3> densityCurveMaximums(const ProfileCurveSet &curves) {
+  std::array<float, 3> maxima = {0.0f, 0.0f, 0.0f};
+  for (uint32_t channel = 0; channel < 3u; ++channel) {
+    for (uint32_t i = 0; i < curves.exposureCount; ++i) {
+      maxima[channel] = std::max(maxima[channel], curves.densityCurves[i * 3u + channel]);
+    }
+  }
+  return maxima;
+}
+
+std::vector<float> makeDirCorrectedDensityCurves(
+  const ProfileCurveSet &filmCurves,
+  const KernelDirInfo &dirInfo
+) {
+  const bool positive = std::strcmp(filmCurves.type, "positive") == 0;
+  std::vector<float> corrected(static_cast<size_t>(filmCurves.exposureCount) * 3u, 0.0f);
+  for (uint32_t receiver = 0; receiver < 3u; ++receiver) {
+    std::vector<float> logExposure0(filmCurves.exposureCount, 0.0f);
+    for (uint32_t i = 0; i < filmCurves.exposureCount; ++i) {
+      const float d0 = filmCurves.densityCurves[i * 3u];
+      const float d1 = filmCurves.densityCurves[i * 3u + 1u];
+      const float d2 = filmCurves.densityCurves[i * 3u + 2u];
+      const float silver0 = positive ? dirInfo.densityMax0 - d0 : d0;
+      const float silver1 = positive ? dirInfo.densityMax1 - d1 : d1;
+      const float silver2 = positive ? dirInfo.densityMax2 - d2 : d2;
+      float amount = 0.0f;
+      if (receiver == 0u) {
+        amount = silver0 * dirInfo.matrix00 + silver1 * dirInfo.matrix10 + silver2 * dirInfo.matrix20;
+      } else if (receiver == 1u) {
+        amount = silver0 * dirInfo.matrix01 + silver1 * dirInfo.matrix11 + silver2 * dirInfo.matrix21;
+      } else {
+        amount = silver0 * dirInfo.matrix02 + silver1 * dirInfo.matrix12 + silver2 * dirInfo.matrix22;
+      }
+      logExposure0[i] = filmCurves.logExposure[i] - amount;
+    }
+    for (uint32_t i = 0; i < filmCurves.exposureCount; ++i) {
+      corrected[i * 3u + receiver] = interpLinear(
+        logExposure0,
+        filmCurves.densityCurves,
+        receiver,
+        filmCurves.logExposure[i]
+      );
+    }
+  }
+  return corrected;
+}
+
+uint32_t halfToFloatBits(uint16_t h) {
+  const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
+  uint32_t exponent = (h >> 10) & 0x1fu;
+  uint32_t mantissa = h & 0x03ffu;
+
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      return sign;
+    }
+    exponent = 1;
+    while ((mantissa & 0x0400u) == 0) {
+      mantissa <<= 1;
+      --exponent;
+    }
+    mantissa &= 0x03ffu;
+  } else if (exponent == 31) {
+    return sign | 0x7f800000u | (mantissa << 13);
+  }
+
+  exponent = exponent + (127 - 15);
+  return sign | (exponent << 23) | (mantissa << 13);
+}
+
+float halfToFloat(uint16_t h) {
+  const uint32_t bits = halfToFloatBits(h);
+  float out = 0.0f;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+uint16_t floatToHalf(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
+  uint32_t mantissa = bits & 0x007fffffu;
+
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return static_cast<uint16_t>(sign);
+    }
+    mantissa = (mantissa | 0x00800000u) >> static_cast<uint32_t>(1 - exponent);
+    return static_cast<uint16_t>(sign | ((mantissa + 0x00001000u) >> 13));
+  }
+  if (exponent >= 31) {
+    return static_cast<uint16_t>(sign | 0x7c00u);
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | ((mantissa + 0x00001000u) >> 13));
+}
+
+bool isSupportedRgba(const ImageView &source, const MutableImageView &destination) {
+  return source.components == 4 &&
+         destination.components == 4 &&
+         (source.bytesPerComponent == 2 || source.bytesPerComponent == 4) &&
+         (destination.bytesPerComponent == 2 || destination.bytesPerComponent == 4);
+}
+
+void copySourceToFloatStaging(
+  const ImageView &source,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height,
+  float *staging
+) {
+  const auto *sourceBase = static_cast<const unsigned char *>(source.data);
+  for (int32_t y = 0; y < height; ++y) {
+    const int32_t sourceY = window.y1 + y - source.y1;
+    const int32_t sourceX = window.x1 - source.x1;
+    const auto *row = sourceBase + static_cast<size_t>(sourceY) * source.rowBytes + static_cast<size_t>(sourceX) * source.components * source.bytesPerComponent;
+    for (int32_t x = 0; x < width; ++x) {
+      float *dst = staging + (static_cast<size_t>(y) * width + x) * 4;
+      if (source.bytesPerComponent == 4) {
+        const auto *src = reinterpret_cast<const float *>(row + static_cast<size_t>(x) * 4 * sizeof(float));
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+      } else {
+        const auto *src = reinterpret_cast<const uint16_t *>(row + static_cast<size_t>(x) * 4 * sizeof(uint16_t));
+        dst[0] = halfToFloat(src[0]);
+        dst[1] = halfToFloat(src[1]);
+        dst[2] = halfToFloat(src[2]);
+        dst[3] = halfToFloat(src[3]);
+      }
+    }
+  }
+}
+
+void copyFloatStagingToDestination(
+  const float *staging,
+  const MutableImageView &destination,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height
+) {
+  auto *destinationBase = static_cast<unsigned char *>(destination.data);
+  for (int32_t y = 0; y < height; ++y) {
+    const int32_t destinationY = window.y1 + y - destination.y1;
+    const int32_t destinationX = window.x1 - destination.x1;
+    auto *row = destinationBase + static_cast<size_t>(destinationY) * destination.rowBytes + static_cast<size_t>(destinationX) * destination.components * destination.bytesPerComponent;
+    for (int32_t x = 0; x < width; ++x) {
+      const float *src = staging + (static_cast<size_t>(y) * width + x) * 4;
+      if (destination.bytesPerComponent == 4) {
+        auto *dst = reinterpret_cast<float *>(row + static_cast<size_t>(x) * 4 * sizeof(float));
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+      } else {
+        auto *dst = reinterpret_cast<uint16_t *>(row + static_cast<size_t>(x) * 4 * sizeof(uint16_t));
+        dst[0] = floatToHalf(src[0]);
+        dst[1] = floatToHalf(src[1]);
+        dst[2] = floatToHalf(src[2]);
+        dst[3] = floatToHalf(src[3]);
+      }
+    }
+  }
+}
+
+float sampleTransferLut(
+  float value,
+  int32_t colorSpace,
+  const float *luts
+) {
+  if (!luts || kSpektraColorTransferLutSize <= 1u) {
+    return value;
+  }
+  const float decodeMin = colorDecodeLutMin();
+  const float decodeMax = colorDecodeLutMax();
+  const float range = std::max(decodeMax - decodeMin, 1.0e-6f);
+  const float step = range / static_cast<float>(kSpektraColorTransferLutSize - 1u);
+  const uint32_t offset = static_cast<uint32_t>(std::clamp<int32_t>(colorSpace, 0, static_cast<int32_t>(kSpektraColorSpaceCount - 1u))) *
+    kSpektraColorTransferLutSize;
+  if (value <= decodeMin) {
+    const float y0 = luts[offset];
+    const float y1 = luts[offset + 1u];
+    return y0 + (value - decodeMin) * ((y1 - y0) / std::max(step, 1.0e-12f));
+  }
+  if (value >= decodeMax) {
+    const float y0 = luts[offset + kSpektraColorTransferLutSize - 2u];
+    const float y1 = luts[offset + kSpektraColorTransferLutSize - 1u];
+    return y1 + (value - decodeMax) * ((y1 - y0) / std::max(step, 1.0e-12f));
+  }
+  const float t = (value - decodeMin) / range;
+  const float position = t * static_cast<float>(kSpektraColorTransferLutSize - 1u);
+  const uint32_t lo = static_cast<uint32_t>(std::floor(position));
+  const uint32_t hi = std::min(lo + 1u, kSpektraColorTransferLutSize - 1u);
+  const float f = position - static_cast<float>(lo);
+  return luts[offset + lo] + (luts[offset + hi] - luts[offset + lo]) * f;
+}
+
+float autoExposureMeterY(float r, float g, float b, const RenderParams &params) {
+  const int32_t colorSpace = std::clamp(
+    static_cast<int32_t>(params.inputColorSpace),
+    0,
+    static_cast<int32_t>(kSpektraColorSpaceCount - 1u)
+  );
+  const uint32_t *transferKinds = colorTransferKinds();
+  if (transferKinds && transferKinds[colorSpace] != 0u) {
+    const float *decodeLuts = colorDecodeLuts();
+    r = sampleTransferLut(r, colorSpace, decodeLuts);
+    g = sampleTransferLut(g, colorSpace, decodeLuts);
+    b = sampleTransferLut(b, colorSpace, decodeLuts);
+  }
+  const float *meterMatrices = inputMeterXyzMatrices();
+  if (!meterMatrices) {
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  }
+  const float *matrix = meterMatrices + static_cast<size_t>(colorSpace) * 9u;
+  return matrix[3] * r + matrix[4] * g + matrix[5] * b;
+}
+
+void autoExposurePreviewShape(int32_t width, int32_t height, int32_t &previewWidth, int32_t &previewHeight) {
+  constexpr int32_t kPreviewMaxSize = 256;
+  const int32_t longEdge = std::max(width, height);
+  if (longEdge <= kPreviewMaxSize) {
+    previewWidth = width;
+    previewHeight = height;
+    return;
+  }
+  const double scale = static_cast<double>(kPreviewMaxSize) / static_cast<double>(longEdge);
+  previewWidth = std::max(1, static_cast<int32_t>(std::lround(static_cast<double>(width) * scale)));
+  previewHeight = std::max(1, static_cast<int32_t>(std::lround(static_cast<double>(height) * scale)));
+}
+
+float measureAutoExposureEv(
+  const float *source,
+  int32_t width,
+  int32_t height,
+  const RenderParams &params
+) {
+  if (!source || width <= 0 || height <= 0) {
+    return 0.0f;
+  }
+
+  int32_t previewWidth = width;
+  int32_t previewHeight = height;
+  autoExposurePreviewShape(width, height, previewWidth, previewHeight);
+  std::vector<float> luminance;
+  luminance.reserve(static_cast<size_t>(previewWidth) * static_cast<size_t>(previewHeight));
+
+  for (int32_t y = 0; y < previewHeight; ++y) {
+    const int32_t sourceY = std::min(
+      height - 1,
+      static_cast<int32_t>((static_cast<int64_t>(y) * height) / previewHeight)
+    );
+    for (int32_t x = 0; x < previewWidth; ++x) {
+      const int32_t sourceX = std::min(
+        width - 1,
+        static_cast<int32_t>((static_cast<int64_t>(x) * width) / previewWidth)
+      );
+      const float *pixel = source + (static_cast<size_t>(sourceY) * width + sourceX) * 4u;
+      luminance.push_back(autoExposureMeterY(pixel[0], pixel[1], pixel[2], params));
+    }
+  }
+  if (luminance.empty()) {
+    return 0.0f;
+  }
+
+  double meteredY = 0.0;
+  if (params.autoExposureMethod == AutoExposureMethod::Median) {
+    const size_t mid = luminance.size() / 2u;
+    std::nth_element(luminance.begin(), luminance.begin() + static_cast<std::ptrdiff_t>(mid), luminance.end());
+    meteredY = luminance[mid];
+    if ((luminance.size() & 1u) == 0u) {
+      const float upper = luminance[mid];
+      std::nth_element(luminance.begin(), luminance.begin() + static_cast<std::ptrdiff_t>(mid - 1u), luminance.begin() + static_cast<std::ptrdiff_t>(mid));
+      meteredY = 0.5 * (static_cast<double>(luminance[mid - 1u]) + static_cast<double>(upper));
+    }
+  } else {
+    const double normX = static_cast<double>(previewWidth) / static_cast<double>(std::max(previewWidth, previewHeight));
+    const double normY = static_cast<double>(previewHeight) / static_cast<double>(std::max(previewWidth, previewHeight));
+    constexpr double kSigma = 0.2;
+    double weightedSum = 0.0;
+    double weightSum = 0.0;
+    size_t index = 0;
+    for (int32_t y = 0; y < previewHeight; ++y) {
+      const double yf = (static_cast<double>(y) / static_cast<double>(previewHeight) - 0.5) * normY;
+      for (int32_t x = 0; x < previewWidth; ++x, ++index) {
+        const double xf = (static_cast<double>(x) / static_cast<double>(previewWidth) - 0.5) * normX;
+        const double weight = std::exp(-(xf * xf + yf * yf) / (2.0 * kSigma * kSigma));
+        weightedSum += static_cast<double>(luminance[index]) * weight;
+        weightSum += weight;
+      }
+    }
+    meteredY = weightedSum / std::max(weightSum, 1.0e-30);
+  }
+
+  const double exposure = meteredY / 0.184;
+  if (!(exposure > 0.0) || !std::isfinite(exposure)) {
+    return 0.0f;
+  }
+  const double ev = -std::log2(exposure);
+  return std::isfinite(ev) ? static_cast<float>(ev) : 0.0f;
+}
+
+const void *contiguousFloatWindowPointer(
+  const ImageView &view,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height
+) {
+  if (view.bytesPerComponent != 4 ||
+      view.components != 4 ||
+      window.x1 != view.x1 ||
+      width <= 0 ||
+      height <= 0 ||
+      view.rowBytes != width * static_cast<int32_t>(4 * sizeof(float))) {
+    return nullptr;
+  }
+  const int32_t sourceY = window.y1 - view.y1;
+  if (sourceY < 0 || sourceY + height > view.height) {
+    return nullptr;
+  }
+  const auto *base = static_cast<const unsigned char *>(view.data);
+  return base + static_cast<size_t>(sourceY) * view.rowBytes;
+}
+
+void *contiguousFloatWindowPointer(
+  const MutableImageView &view,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height
+) {
+  if (view.bytesPerComponent != 4 ||
+      view.components != 4 ||
+      window.x1 != view.x1 ||
+      width <= 0 ||
+      height <= 0 ||
+      view.rowBytes != width * static_cast<int32_t>(4 * sizeof(float))) {
+    return nullptr;
+  }
+  const int32_t destinationY = window.y1 - view.y1;
+  if (destinationY < 0 || destinationY + height > view.height) {
+    return nullptr;
+  }
+  auto *base = static_cast<unsigned char *>(view.data);
+  return base + static_cast<size_t>(destinationY) * view.rowBytes;
+}
+
+} // namespace
+
+struct MetalRenderer::Impl {
+  id<MTLDevice> device = nil;
+  id<MTLCommandQueue> commandQueue = nil;
+  id<MTLComputePipelineState> enlargerResamplePipeline = nil;
+  id<MTLComputePipelineState> grainPipeline = nil;
+  id<MTLComputePipelineState> halationRawExposurePipeline = nil;
+  id<MTLComputePipelineState> halationScatterCoreBlurXPipeline = nil;
+  id<MTLComputePipelineState> halationScatterCoreBlurYPipeline = nil;
+  id<MTLComputePipelineState> halationScatterTailBlurXPipeline = nil;
+  id<MTLComputePipelineState> halationScatterTailBlurYPipeline = nil;
+  id<MTLComputePipelineState> halationScatterResolvePipeline = nil;
+  id<MTLComputePipelineState> halationClearPipeline = nil;
+  id<MTLComputePipelineState> halationBounceBlurXPipeline = nil;
+  id<MTLComputePipelineState> halationBounceBlurYAccumulatePipeline = nil;
+  id<MTLComputePipelineState> halationResolveLogRawPipeline = nil;
+  id<MTLComputePipelineState> halationResolveDensityPipeline = nil;
+  id<MTLComputePipelineState> rawToLogRawPipeline = nil;
+  id<MTLComputePipelineState> developFromRawPipeline = nil;
+  id<MTLComputePipelineState> diffusionComponentBlurXPipeline = nil;
+  id<MTLComputePipelineState> diffusionComponentBlurYAccumulatePipeline = nil;
+  id<MTLComputePipelineState> diffusionGroupBlurXPipeline = nil;
+  id<MTLComputePipelineState> diffusionGroupBlurYAccumulatePipeline = nil;
+  id<MTLComputePipelineState> diffusionResolvePipeline = nil;
+  id<MTLComputePipelineState> developFromLogRawPipeline = nil;
+  id<MTLComputePipelineState> dirCorrectionFromDensityPipeline = nil;
+  id<MTLComputePipelineState> copyBufferPipeline = nil;
+  id<MTLComputePipelineState> dirBaselinePipeline = nil;
+  id<MTLComputePipelineState> dirBlurXPipeline = nil;
+  id<MTLComputePipelineState> dirBlurYPipeline = nil;
+  id<MTLComputePipelineState> dirRedevelopPipeline = nil;
+  id<MTLComputePipelineState> previewGrainFromDensityPipeline = nil;
+  id<MTLComputePipelineState> productionGrainLayersFromDensityPipeline = nil;
+  id<MTLComputePipelineState> grainLayerBlurXPipeline = nil;
+  id<MTLComputePipelineState> grainLayerBlurYPipeline = nil;
+  id<MTLComputePipelineState> grainMicroSourcePipeline = nil;
+  id<MTLComputePipelineState> grainMicroBlurXPipeline = nil;
+  id<MTLComputePipelineState> grainMicroBlurYPipeline = nil;
+  id<MTLComputePipelineState> grainResolveDensityPipeline = nil;
+  id<MTLComputePipelineState> grainDensityBlurXPipeline = nil;
+  id<MTLComputePipelineState> grainDensityBlurYPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromDensityPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromDensityFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisTargetDensityPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisTargetDensityNonLayeredPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisTargetDensityHalfPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisTargetDensityNonLayeredHalfPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisTargetDensityTexturePipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisTargetDensityNonLayeredTexturePipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityHalfPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityHalfFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredHalfPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredHalfFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityTexturePipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityTextureFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline = nil;
+  id<MTLComputePipelineState> grainSynthesisResolveDensityPipeline = nil;
+  id<MTLComputePipelineState> frameConstantsPipeline = nil;
+  id<MTLComputePipelineState> finalFromFilmDensityPipeline = nil;
+  id<MTLComputePipelineState> printRawFromFilmDensityPipeline = nil;
+  id<MTLComputePipelineState> finalFromPrintRawPipeline = nil;
+  id<MTLComputePipelineState> scannerBlurXPipeline = nil;
+  id<MTLComputePipelineState> scannerBlurYPipeline = nil;
+  id<MTLComputePipelineState> unsharpBlurXPipeline = nil;
+  id<MTLComputePipelineState> unsharpBlurYPipeline = nil;
+  id<MTLComputePipelineState> bufferToTexturePipeline = nil;
+  id<MTLComputePipelineState> textureToBufferPipeline = nil;
+  id<MTLComputePipelineState> scannerBlurXTexturePipeline = nil;
+  id<MTLComputePipelineState> scannerBlurYTexturePipeline = nil;
+  id<MTLComputePipelineState> unsharpBlurXTexturePipeline = nil;
+  id<MTLComputePipelineState> unsharpBlurYTexturePipeline = nil;
+  id<MTLComputePipelineState> scannerFinalizePipeline = nil;
+  id<MTLComputePipelineState> scannerFinalizeTexturePipeline = nil;
+  std::vector<float> hanatosSpectraData;
+  StaticProfileResources staticResources;
+  std::vector<id<MTLBuffer>> scratchBuffers;
+  std::vector<id<MTLTexture>> scratchTextures;
+  size_t scratchCursor = 0;
+  size_t textureScratchCursor = 0;
+  KernelSpectralInfo spectralInfo{};
+  MetalRenderDiagnostics diagnostics{};
+  std::unordered_map<const void *, std::string> pipelineNames;
+  std::mutex renderMutex;
+  bool preferPrivateScratch = true;
+  bool passGpuTimingEnabled = false;
+  bool useScannerTextures = false;
+  bool useLegacyGrainSynthesis = false;
+  GrainSynthesisSamplerMode grainSynthesisSamplerMode = GrainSynthesisSamplerMode::R2;
+  GrainSynthesisCellMode grainSynthesisCellMode = GrainSynthesisCellMode::OffsetList;
+  GrainSynthesisTargetStorageMode grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::FloatBuffer;
+  uint32_t grainSynthesisRadiusLutSize = 512u;
+  uint32_t diffusionGroupSize = 1;
+  std::string passTimingMode = "off";
+  uint32_t forcedThreadgroupWidth = 0;
+  uint32_t forcedThreadgroupHeight = 0;
+  std::string threadgroupMode = "auto";
+  std::string lastError;
+
+  id<MTLBuffer> newSharedBuffer(const void *bytes, NSUInteger length, const char *name) {
+    if (!bytes || length == 0) {
+      lastError = std::string("Unable to create empty Metal buffer ") + name + ".";
+      return nil;
+    }
+    id<MTLBuffer> buffer = [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+    if (!buffer) {
+      lastError = std::string("Unable to create Metal buffer ") + name + ".";
+    } else {
+      diagnostics.staticAllocationBytes += length;
+      diagnostics.staticAllocationCount += 1;
+      diagnostics.uploadBytes += length;
+    }
+    return buffer;
+  }
+
+  id<MTLBuffer> scratchBuffer(NSUInteger length, const char *name, MTLStorageMode storageMode) {
+    length = std::max<NSUInteger>(length, 16);
+    const size_t index = scratchCursor++;
+    if (index >= scratchBuffers.size()) {
+      scratchBuffers.resize(index + 1u);
+    }
+    id<MTLBuffer> buffer = scratchBuffers[index];
+    if (!buffer || [buffer length] < length || [buffer storageMode] != storageMode) {
+      const MTLResourceOptions options = storageMode == MTLStorageModePrivate
+        ? MTLResourceStorageModePrivate
+        : MTLResourceStorageModeShared;
+      buffer = [device newBufferWithLength:length options:options];
+      if (!buffer && storageMode == MTLStorageModePrivate) {
+        preferPrivateScratch = false;
+        diagnostics.privateScratchEnabled = false;
+        storageMode = MTLStorageModeShared;
+        buffer = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+      }
+      if (!buffer) {
+        lastError = std::string("Unable to allocate Metal scratch buffer ") + name + ".";
+        return nil;
+      }
+      scratchBuffers[index] = buffer;
+      diagnostics.scratchAllocationBytes += length;
+      diagnostics.scratchAllocationCount += 1;
+      if (storageMode == MTLStorageModePrivate) {
+        diagnostics.privateScratchAllocationBytes += length;
+        diagnostics.privateScratchAllocationCount += 1;
+      } else {
+        diagnostics.sharedScratchAllocationBytes += length;
+        diagnostics.sharedScratchAllocationCount += 1;
+      }
+    }
+    return buffer;
+  }
+
+  id<MTLBuffer> sharedScratchBuffer(NSUInteger length, const char *name) {
+    return scratchBuffer(length, name, MTLStorageModeShared);
+  }
+
+  id<MTLBuffer> gpuScratchBuffer(NSUInteger length, const char *name) {
+    return scratchBuffer(length, name, preferPrivateScratch ? MTLStorageModePrivate : MTLStorageModeShared);
+  }
+
+  id<MTLTexture> gpuScratchTexture(NSUInteger width, NSUInteger height, const char *name) {
+    const size_t index = textureScratchCursor++;
+    if (index >= scratchTextures.size()) {
+      scratchTextures.resize(index + 1u);
+    }
+    id<MTLTexture> texture = scratchTextures[index];
+    if (!texture || [texture width] < width || [texture height] < height ||
+        [texture textureType] != MTLTextureType2D || [texture pixelFormat] != MTLPixelFormatRGBA32Float) {
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                                                                            width:width
+                                                                                           height:height
+                                                                                        mipmapped:NO];
+      descriptor.storageMode = MTLStorageModePrivate;
+      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      texture = [device newTextureWithDescriptor:descriptor];
+      if (!texture) {
+        lastError = std::string("Unable to allocate Metal scratch texture ") + name + ".";
+        return nil;
+      }
+      scratchTextures[index] = texture;
+      const uint64_t bytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4u * sizeof(float);
+      diagnostics.scratchAllocationBytes += bytes;
+      diagnostics.scratchAllocationCount += 1;
+      diagnostics.privateScratchAllocationBytes += bytes;
+      diagnostics.privateScratchAllocationCount += 1;
+    }
+    return texture;
+  }
+
+  id<MTLTexture> gpuScratchTextureArray(NSUInteger width, NSUInteger height, NSUInteger depth, const char *name) {
+    const size_t index = textureScratchCursor++;
+    if (index >= scratchTextures.size()) {
+      scratchTextures.resize(index + 1u);
+    }
+    id<MTLTexture> texture = scratchTextures[index];
+    if (!texture || [texture width] < width || [texture height] < height ||
+        [texture arrayLength] < depth || [texture textureType] != MTLTextureType2DArray ||
+        [texture pixelFormat] != MTLPixelFormatR16Float) {
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                                                                            width:width
+                                                                                           height:height
+                                                                                        mipmapped:NO];
+      descriptor.textureType = MTLTextureType2DArray;
+      descriptor.arrayLength = depth;
+      descriptor.storageMode = MTLStorageModePrivate;
+      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      texture = [device newTextureWithDescriptor:descriptor];
+      if (!texture) {
+        lastError = std::string("Unable to allocate Metal scratch texture ") + name + ".";
+        return nil;
+      }
+      scratchTextures[index] = texture;
+      const uint64_t bytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) *
+        static_cast<uint64_t>(depth) * sizeof(uint16_t);
+      diagnostics.scratchAllocationBytes += bytes;
+      diagnostics.scratchAllocationCount += 1;
+      diagnostics.privateScratchAllocationBytes += bytes;
+      diagnostics.privateScratchAllocationCount += 1;
+    }
+    return texture;
+  }
+
+  void beginScratchFrame() {
+    scratchCursor = 0;
+    textureScratchCursor = 0;
+  }
+
+  std::string pipelineName(id<MTLComputePipelineState> pipeline) const {
+    const auto it = pipelineNames.find((__bridge const void *)pipeline);
+    return it == pipelineNames.end() ? "unknown" : it->second;
+  }
+
+  id<MTLCounterSet> timestampCounterSet() const {
+    if (!device || ![device respondsToSelector:@selector(counterSets)]) {
+      return nil;
+    }
+    for (id<MTLCounterSet> counterSet in [device counterSets]) {
+      if ([[counterSet name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+        return counterSet;
+      }
+    }
+    return nil;
+  }
+
+  bool supportsDispatchCounterSampling() const {
+    if (!device || ![device respondsToSelector:@selector(supportsCounterSampling:)]) {
+      return false;
+    }
+    if (@available(macOS 11.0, *)) {
+      return [device supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary];
+    }
+    return false;
+  }
+
+  double timestampTicksToMilliseconds(uint64_t ticks) const {
+    if (ticks == MTLCounterErrorValue) {
+      return 0.0;
+    }
+    uint64_t frequency = 1000000000ull;
+    if (@available(macOS 26.0, *)) {
+      if ([device respondsToSelector:@selector(queryTimestampFrequency)]) {
+        const uint64_t queried = [device queryTimestampFrequency];
+        if (queried > 0ull) {
+          frequency = queried;
+        }
+      }
+    }
+    return static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency);
+  }
+
+  bool prepareStaticResources(const RenderParams &params) {
+    if (staticResources.validFor(params)) {
+      return true;
+    }
+
+    staticResources.reset();
+    const ProfileCurveSet *filmCurves = selectedFilmCurves(params);
+    const ProfileCurveSet *paperCurves = selectedPaperCurves(params);
+    if (!filmCurves || filmCurves->exposureCount == 0 || !filmCurves->logExposure || !filmCurves->densityCurves) {
+      lastError = "Unable to locate generated film density curves.";
+      return false;
+    }
+    if (!paperCurves || paperCurves->exposureCount == 0 || !paperCurves->logExposure || !paperCurves->densityCurves) {
+      lastError = "Unable to locate generated paper density curves.";
+      return false;
+    }
+    if (filmCurves->wavelengthCount == 0 || !filmCurves->wavelengths || !filmCurves->logSensitivity || !filmCurves->bandpassHanatos2025) {
+      lastError = "Unable to locate generated film spectral data.";
+      return false;
+    }
+    if (paperCurves->wavelengthCount != filmCurves->wavelengthCount || !paperCurves->logSensitivity) {
+      lastError = "Unable to locate generated paper spectral data.";
+      return false;
+    }
+    if (!filmCurves->channelDensity || !filmCurves->baseDensity || !filmCurves->densityCurveMinimum ||
+        !filmCurves->densityCurveLayers || !filmCurves->densityCurveLayerMaxima) {
+      lastError = "Unable to locate generated film spectral density data.";
+      return false;
+    }
+    if (!filmCurves->halationStrength || !filmCurves->halationFirstSigmaUm) {
+      lastError = "Unable to locate generated film halation data.";
+      return false;
+    }
+    if (!filmCurves->scanIlluminant || !filmCurves->scanToOutputRgb || !standardObserverCmfs()) {
+      lastError = "Unable to locate generated film scan data.";
+      return false;
+    }
+    if (!filmCurves->inputToReferenceXyz || !filmCurves->inputToSrgb ||
+        !filmCurves->mallettBasisIlluminant || filmCurves->mallettRawMidgrayGreen <= 0.0f) {
+      lastError = "Unable to locate generated RGB-to-raw reference data.";
+      return false;
+    }
+    if (!paperCurves->channelDensity || !paperCurves->baseDensity || !paperCurves->scanIlluminant || !paperCurves->scanToOutputRgb) {
+      lastError = "Unable to locate generated paper scan data.";
+      return false;
+    }
+    if (!thKg3Illuminant() || !customEnlargerFilters() || !neutralPrintFilters() || !academyPrinterDensityData()) {
+      lastError = "Unable to locate generated print exposure data.";
+      return false;
+    }
+    if (!colorDecodeLuts() || !colorEncodeLuts() || !colorTransferKinds() || !inputMeterXyzMatrices()) {
+      lastError = "Unable to locate generated color transform data.";
+      return false;
+    }
+
+    StaticProfileResources next{};
+    next.film = params.film;
+    next.paper = params.paper;
+    next.cameraUvFilterEnabled = params.cameraUvFilterEnabled;
+    next.cameraUvCutNm = params.cameraUvCutNm;
+    next.cameraIrFilterEnabled = params.cameraIrFilterEnabled;
+    next.cameraIrCutNm = params.cameraIrCutNm;
+    next.filmCurves = filmCurves;
+    next.paperCurves = paperCurves;
+    next.curveInfo = {filmCurves->exposureCount, 0u, 0u, 0u};
+    next.paperCurveInfo = {paperCurves->exposureCount, 0u, 0u, 0u};
+    next.colorInfo = {
+      kSpektraColorSpaceCount,
+      kSpektraColorTransferLutSize,
+      colorDecodeLutMin(),
+      colorDecodeLutMax(),
+      colorEncodeLutMin(),
+      colorEncodeLutMax(),
+      0.0f,
+      0.0f
+    };
+    next.spectralInfo = spectralInfo;
+    next.spectralInfo.filmWavelengthCount = filmCurves->wavelengthCount;
+    next.spectralInfo.filmCount = kSpektraFilmCount;
+    next.spectralInfo.paperCount = kSpektraPaperCount;
+    next.spectralInfo.filmPositive = std::strcmp(filmCurves->type, "positive") == 0 ? 1u : 0u;
+    next.spectralInfo.mallettRawMidgrayGreen = filmCurves->mallettRawMidgrayGreen;
+    next.spectralInfo.filmDensityCurveMinimum0 = filmCurves->densityCurveMinimum[0];
+    next.spectralInfo.filmDensityCurveMinimum1 = filmCurves->densityCurveMinimum[1];
+    next.spectralInfo.filmDensityCurveMinimum2 = filmCurves->densityCurveMinimum[2];
+    const std::array<float, 3> filmDensityCurveMaximum = densityCurveMaximums(*filmCurves);
+    next.spectralInfo.filmDensityCurveMaximum0 = filmDensityCurveMaximum[0];
+    next.spectralInfo.filmDensityCurveMaximum1 = filmDensityCurveMaximum[1];
+    next.spectralInfo.filmDensityCurveMaximum2 = filmDensityCurveMaximum[2];
+    const std::array<float, 3> paperDensityCurveMaximum = densityCurveMaximums(*paperCurves);
+    next.spectralInfo.paperDensityCurveMaximum0 = paperDensityCurveMaximum[0];
+    next.spectralInfo.paperDensityCurveMaximum1 = paperDensityCurveMaximum[1];
+    next.spectralInfo.paperDensityCurveMaximum2 = paperDensityCurveMaximum[2];
+
+    const NSUInteger logExposureBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * sizeof(float);
+    const NSUInteger densityCurveBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 3u * sizeof(float);
+    const NSUInteger densityLayerBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 9u * sizeof(float);
+    const NSUInteger densityLayerMaxBytes = 9u * sizeof(float);
+    const NSUInteger paperLogExposureBytes = static_cast<NSUInteger>(paperCurves->exposureCount) * sizeof(float);
+    const NSUInteger paperDensityCurveBytes = static_cast<NSUInteger>(paperCurves->exposureCount) * 3u * sizeof(float);
+    const NSUInteger wavelengthBytes = static_cast<NSUInteger>(filmCurves->wavelengthCount) * sizeof(float);
+    const NSUInteger sensitivityBytes = static_cast<NSUInteger>(filmCurves->wavelengthCount) * 3u * sizeof(float);
+    const NSUInteger baseDensityBytes = static_cast<NSUInteger>(filmCurves->wavelengthCount) * sizeof(float);
+    const NSUInteger neutralPrintFilterBytes = static_cast<NSUInteger>(kSpektraPaperCount) * static_cast<NSUInteger>(kSpektraFilmCount) * 3u * sizeof(float);
+    const NSUInteger inputMatrixBytes = static_cast<NSUInteger>(kSpektraColorSpaceCount) * 9u * sizeof(float);
+    const NSUInteger transferLutBytes = static_cast<NSUInteger>(kSpektraColorSpaceCount) * static_cast<NSUInteger>(kSpektraColorTransferLutSize) * sizeof(float);
+    const NSUInteger transferKindBytes = static_cast<NSUInteger>(kSpektraColorSpaceCount) * sizeof(uint32_t);
+
+    const std::vector<float> baseFilmSensitivityLinear = makeLinearSensitivity(filmCurves->logSensitivity, filmCurves->wavelengthCount);
+    const std::vector<float> filmSensitivityLinear = applyCameraBandPass(*filmCurves, baseFilmSensitivityLinear, params);
+    const std::vector<float> paperSensitivityLinear = makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
+    const bool cameraFilterActive = params.cameraUvFilterEnabled || params.cameraIrFilterEnabled;
+    const std::array<float, 9> mallettRawMatrix = makeMallettRawMatrix(
+      *filmCurves,
+      filmSensitivityLinear,
+      baseFilmSensitivityLinear,
+      cameraFilterActive
+    );
+    const std::vector<float> hanatosRawResponse = makeHanatosRawResponse(
+      *filmCurves,
+      filmSensitivityLinear,
+      hanatosSpectraData,
+      hanatosSpectraLutInfo()
+    );
+
+    std::vector<float> paperScanDensityData;
+    paperScanDensityData.reserve(
+      static_cast<size_t>(filmCurves->wavelengthCount) * 4u +
+      static_cast<size_t>(filmCurves->exposureCount) * 9u +
+      9u
+    );
+    paperScanDensityData.insert(paperScanDensityData.end(), paperCurves->channelDensity, paperCurves->channelDensity + filmCurves->wavelengthCount * 3u);
+    paperScanDensityData.insert(paperScanDensityData.end(), paperCurves->baseDensity, paperCurves->baseDensity + filmCurves->wavelengthCount);
+    paperScanDensityData.insert(paperScanDensityData.end(), filmCurves->densityCurveLayers, filmCurves->densityCurveLayers + filmCurves->exposureCount * 9u);
+    paperScanDensityData.insert(paperScanDensityData.end(), filmCurves->densityCurveLayerMaxima, filmCurves->densityCurveLayerMaxima + 9u);
+
+    std::vector<float> scanIlluminantsAndCmfs;
+    scanIlluminantsAndCmfs.reserve(static_cast<size_t>(filmCurves->wavelengthCount) * 5u);
+    scanIlluminantsAndCmfs.insert(scanIlluminantsAndCmfs.end(), filmCurves->scanIlluminant, filmCurves->scanIlluminant + filmCurves->wavelengthCount);
+    scanIlluminantsAndCmfs.insert(scanIlluminantsAndCmfs.end(), paperCurves->scanIlluminant, paperCurves->scanIlluminant + filmCurves->wavelengthCount);
+    scanIlluminantsAndCmfs.insert(scanIlluminantsAndCmfs.end(), standardObserverCmfs(), standardObserverCmfs() + filmCurves->wavelengthCount * 3u);
+
+    std::vector<float> scanToOutputRgbData;
+    scanToOutputRgbData.reserve(static_cast<size_t>(kSpektraColorSpaceCount) * 18u);
+    scanToOutputRgbData.insert(scanToOutputRgbData.end(), filmCurves->scanToOutputRgb, filmCurves->scanToOutputRgb + kSpektraColorSpaceCount * 9u);
+    scanToOutputRgbData.insert(scanToOutputRgbData.end(), paperCurves->scanToOutputRgb, paperCurves->scanToOutputRgb + kSpektraColorSpaceCount * 9u);
+
+    next.curveInfoBuffer = newSharedBuffer(&next.curveInfo, sizeof(next.curveInfo), "film curve info");
+    next.logExposureBuffer = newSharedBuffer(filmCurves->logExposure, logExposureBytes, "film log exposure");
+    next.densityCurvesBuffer = newSharedBuffer(filmCurves->densityCurves, densityCurveBytes, "film density curves");
+    next.spectralInfoBuffer = newSharedBuffer(&next.spectralInfo, sizeof(next.spectralInfo), "spectral info");
+    next.wavelengthsBuffer = newSharedBuffer(filmCurves->wavelengths, wavelengthBytes, "film wavelengths");
+    next.logSensitivityBuffer = newSharedBuffer(filmSensitivityLinear.data(), sensitivityBytes, "film linear sensitivity");
+    next.bandpassHanatosBuffer = newSharedBuffer(filmCurves->bandpassHanatos2025, sensitivityBytes, "film Hanatos bandpass");
+    next.hanatosRawResponseBuffer = newSharedBuffer(hanatosRawResponse.data(), hanatosRawResponse.size() * sizeof(float), "film Hanatos raw response");
+    next.mallettBasisIlluminantBuffer = newSharedBuffer(mallettRawMatrix.data(), mallettRawMatrix.size() * sizeof(float), "film Mallett raw matrix");
+    next.inputToReferenceXyzBuffer = newSharedBuffer(filmCurves->inputToReferenceXyz, inputMatrixBytes, "input to reference XYZ");
+    next.inputToSrgbBuffer = newSharedBuffer(filmCurves->inputToSrgb, inputMatrixBytes, "input to sRGB");
+    next.colorInfoBuffer = newSharedBuffer(&next.colorInfo, sizeof(next.colorInfo), "color info");
+    next.colorDecodeLutBuffer = newSharedBuffer(colorDecodeLuts(), transferLutBytes, "color decode LUT");
+    next.colorTransferKindBuffer = newSharedBuffer(colorTransferKinds(), transferKindBytes, "color transfer kind");
+    next.paperCurveInfoBuffer = newSharedBuffer(&next.paperCurveInfo, sizeof(next.paperCurveInfo), "paper curve info");
+    next.paperLogExposureBuffer = newSharedBuffer(paperCurves->logExposure, paperLogExposureBytes, "paper log exposure");
+    next.paperDensityCurvesBuffer = newSharedBuffer(paperCurves->densityCurves, paperDensityCurveBytes, "paper density curves");
+    next.filmChannelDensityBuffer = newSharedBuffer(filmCurves->channelDensity, sensitivityBytes, "film channel density");
+    next.filmBaseDensityBuffer = newSharedBuffer(filmCurves->baseDensity, baseDensityBytes, "film base density");
+    next.paperLogSensitivityBuffer = newSharedBuffer(paperSensitivityLinear.data(), sensitivityBytes, "paper linear sensitivity");
+    next.thKg3IlluminantBuffer = newSharedBuffer(thKg3Illuminant(), baseDensityBytes, "TH-KG3 illuminant");
+    next.customEnlargerFiltersBuffer = newSharedBuffer(customEnlargerFilters(), sensitivityBytes, "custom enlarger filters");
+    next.neutralPrintFiltersBuffer = newSharedBuffer(neutralPrintFilters(), neutralPrintFilterBytes, "neutral print filters");
+    next.academyPrinterDensityDataBuffer = newSharedBuffer(
+      academyPrinterDensityData(),
+      sensitivityBytes + neutralPrintFilterBytes,
+      "Academy printer density data"
+    );
+    next.paperScanDensityDataBuffer = newSharedBuffer(paperScanDensityData.data(), paperScanDensityData.size() * sizeof(float), "paper scan density data");
+    next.scanIlluminantsAndCmfsBuffer = newSharedBuffer(scanIlluminantsAndCmfs.data(), scanIlluminantsAndCmfs.size() * sizeof(float), "scan illuminants and CMFs");
+    next.scanToOutputRgbDataBuffer = newSharedBuffer(scanToOutputRgbData.data(), scanToOutputRgbData.size() * sizeof(float), "scan output matrices");
+    next.colorEncodeLutBuffer = newSharedBuffer(colorEncodeLuts(), transferLutBytes, "color encode LUT");
+
+    if (!next.validFor(params)) {
+      if (lastError.empty()) {
+        lastError = "Unable to create static Metal resources.";
+      }
+      return false;
+    }
+    staticResources = next;
+    lastError.clear();
+    return true;
+  }
+
+  Impl() {
+    @autoreleasepool {
+      preferPrivateScratch = envString("SPEKTRAFILM_SCRATCH_STORAGE", "private") != "shared";
+      useLegacyGrainSynthesis = envFlagEnabled("SPEKTRAFILM_GRAIN_SYNTHESIS_LEGACY");
+      const std::string grainSamplerText = envString("SPEKTRAFILM_GRAIN_SYNTHESIS_SAMPLER", "r2");
+      if (grainSamplerText == "antithetic") {
+        grainSynthesisSamplerMode = GrainSynthesisSamplerMode::Antithetic;
+      } else if (grainSamplerText == "sobol-blue") {
+        grainSynthesisSamplerMode = GrainSynthesisSamplerMode::SobolBlue;
+      } else {
+        grainSynthesisSamplerMode = GrainSynthesisSamplerMode::R2;
+      }
+      const std::string radiusLutText = envString("SPEKTRAFILM_GRAIN_SYNTHESIS_RADIUS_LUT", "512");
+      if (radiusLutText == "off" || radiusLutText == "0") {
+        grainSynthesisRadiusLutSize = 0u;
+      } else if (radiusLutText == "256") {
+        grainSynthesisRadiusLutSize = 256u;
+      } else {
+        grainSynthesisRadiusLutSize = 512u;
+      }
+      const std::string cellModeText = envString("SPEKTRAFILM_GRAIN_SYNTHESIS_CELL_MODE", "offset-list");
+      if (cellModeText == "current") {
+        grainSynthesisCellMode = GrainSynthesisCellMode::Current;
+      } else if (cellModeText == "threadgroup-cache") {
+        grainSynthesisCellMode = GrainSynthesisCellMode::ThreadgroupCache;
+      } else {
+        grainSynthesisCellMode = GrainSynthesisCellMode::OffsetList;
+      }
+      const std::string targetStorageText = envString("SPEKTRAFILM_GRAIN_SYNTHESIS_TARGET_STORAGE", "float-buffer");
+      if (targetStorageText == "half-buffer") {
+        grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::HalfBuffer;
+      } else if (targetStorageText == "r16-texture-array") {
+        grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::R16TextureArray;
+      } else {
+        grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::FloatBuffer;
+      }
+      passTimingMode = envString("SPEKTRAFILM_PASS_TIMING", "");
+      if (passTimingMode.empty()) {
+        passTimingMode = envFlagEnabled("SPEKTRAFILM_PASS_COUNTERS") ? "auto" : "off";
+      }
+      if (passTimingMode != "off" && passTimingMode != "auto" &&
+          passTimingMode != "counter" && passTimingMode != "split") {
+        passTimingMode = "off";
+      }
+      passGpuTimingEnabled = passTimingMode != "off";
+      useScannerTextures = envString("SPEKTRAFILM_SCANNER_IMAGE_STORAGE", "buffer") == "texture";
+      const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "1");
+      if (diffusionGroupSizeText == "1") {
+        diffusionGroupSize = 1u;
+      } else if (diffusionGroupSizeText == "2") {
+        diffusionGroupSize = 2u;
+      } else {
+        diffusionGroupSize = 4u;
+      }
+      threadgroupMode = envString("SPEKTRAFILM_THREADGROUP", "auto");
+      if (threadgroupMode == "16x16") {
+        forcedThreadgroupWidth = 16u;
+        forcedThreadgroupHeight = 16u;
+      } else if (threadgroupMode == "32x8") {
+        forcedThreadgroupWidth = 32u;
+        forcedThreadgroupHeight = 8u;
+      } else if (threadgroupMode == "8x32") {
+        forcedThreadgroupWidth = 8u;
+        forcedThreadgroupHeight = 32u;
+      } else if (threadgroupMode == "64x4") {
+        forcedThreadgroupWidth = 64u;
+        forcedThreadgroupHeight = 4u;
+      } else {
+        threadgroupMode = "auto";
+      }
+
+      device = MTLCreateSystemDefaultDevice();
+      if (!device) {
+        lastError = "Metal is not available on this system.";
+        return;
+      }
+      commandQueue = [device newCommandQueue];
+      if (!commandQueue) {
+        lastError = "Unable to create Metal command queue.";
+        return;
+      }
+
+      NSURL *libraryURL = findBundleResourceURL(@"SpektraFilm", @"metallib");
+      if (!libraryURL) {
+        lastError = "Unable to locate SpektraFilm.metallib in bundle resources.";
+        return;
+      }
+
+      NSError *error = nil;
+      id<MTLLibrary> library = [device newLibraryWithURL:libraryURL error:&error];
+      if (!library) {
+        lastError = error ? [[error localizedDescription] UTF8String] : "Unable to load Metal library.";
+        return;
+      }
+
+      auto makePipeline = [&](NSString *name) -> id<MTLComputePipelineState> {
+        id<MTLFunction> function = [library newFunctionWithName:name];
+        if (!function) {
+          lastError = std::string("Metal function ") + [name UTF8String] + " was not found.";
+          return nil;
+        }
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) {
+          lastError = error ? [[error localizedDescription] UTF8String] : (std::string("Unable to create Metal pipeline ") + [name UTF8String] + ".");
+          return nil;
+        }
+        pipelineNames[(__bridge const void *)pipeline] = [name UTF8String];
+        return pipeline;
+      };
+
+      enlargerResamplePipeline = makePipeline(@"spektrafilm_enlarger_resample");
+      grainPipeline = makePipeline(@"spektrafilm_grain_preview");
+      halationRawExposurePipeline = makePipeline(@"spektrafilm_halation_raw_exposure");
+      halationScatterCoreBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_core_blur_x");
+      halationScatterCoreBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_core_blur_y");
+      halationScatterTailBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_blur_x");
+      halationScatterTailBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_blur_y");
+      halationScatterResolvePipeline = makePipeline(@"spektrafilm_halation_scatter_resolve");
+      halationClearPipeline = makePipeline(@"spektrafilm_halation_clear");
+      halationBounceBlurXPipeline = makePipeline(@"spektrafilm_halation_bounce_blur_x");
+      halationBounceBlurYAccumulatePipeline = makePipeline(@"spektrafilm_halation_bounce_blur_y_accumulate");
+      halationResolveLogRawPipeline = makePipeline(@"spektrafilm_halation_resolve_log_raw");
+      halationResolveDensityPipeline = makePipeline(@"spektrafilm_halation_resolve_density");
+      rawToLogRawPipeline = makePipeline(@"spektrafilm_raw_to_log_raw");
+      developFromRawPipeline = makePipeline(@"spektrafilm_develop_from_raw");
+      diffusionComponentBlurXPipeline = makePipeline(@"spektrafilm_diffusion_component_blur_x");
+      diffusionComponentBlurYAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_component_blur_y_accumulate");
+      diffusionGroupBlurXPipeline = makePipeline(@"spektrafilm_diffusion_group_blur_x");
+      diffusionGroupBlurYAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_group_blur_y_accumulate");
+      diffusionResolvePipeline = makePipeline(@"spektrafilm_diffusion_resolve");
+      developFromLogRawPipeline = makePipeline(@"spektrafilm_develop_from_log_raw");
+      dirCorrectionFromDensityPipeline = makePipeline(@"spektrafilm_dir_correction_from_density");
+      copyBufferPipeline = makePipeline(@"spektrafilm_copy_buffer");
+      dirBaselinePipeline = makePipeline(@"spektrafilm_dir_baseline");
+      dirBlurXPipeline = makePipeline(@"spektrafilm_dir_blur_x");
+      dirBlurYPipeline = makePipeline(@"spektrafilm_dir_blur_y");
+      dirRedevelopPipeline = makePipeline(@"spektrafilm_dir_redevelop");
+      previewGrainFromDensityPipeline = makePipeline(@"spektrafilm_preview_grain_from_density");
+      productionGrainLayersFromDensityPipeline = makePipeline(@"spektrafilm_production_grain_layers_from_density");
+      grainLayerBlurXPipeline = makePipeline(@"spektrafilm_grain_layer_blur_x");
+      grainLayerBlurYPipeline = makePipeline(@"spektrafilm_grain_layer_blur_y");
+      grainMicroSourcePipeline = makePipeline(@"spektrafilm_grain_microstructure_source");
+      grainMicroBlurXPipeline = makePipeline(@"spektrafilm_grain_micro_blur_x");
+      grainMicroBlurYPipeline = makePipeline(@"spektrafilm_grain_micro_blur_y");
+      grainResolveDensityPipeline = makePipeline(@"spektrafilm_grain_resolve_density");
+      grainDensityBlurXPipeline = makePipeline(@"spektrafilm_grain_density_blur_x");
+      grainDensityBlurYPipeline = makePipeline(@"spektrafilm_grain_density_blur_y");
+      grainSynthesisLayersFromDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_density");
+      grainSynthesisLayersFromDensityFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_density_fixed_radius");
+      grainSynthesisTargetDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density");
+      grainSynthesisTargetDensityNonLayeredPipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density_nonlayered");
+      grainSynthesisTargetDensityHalfPipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density_half");
+      grainSynthesisTargetDensityNonLayeredHalfPipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density_nonlayered_half");
+      grainSynthesisTargetDensityTexturePipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density_r16_texture_array");
+      grainSynthesisTargetDensityNonLayeredTexturePipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density_nonlayered_r16_texture_array");
+      grainSynthesisLayersFromTargetDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density");
+      grainSynthesisLayersFromTargetDensityFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_fixed_radius");
+      grainSynthesisLayersFromTargetDensityNonLayeredPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered");
+      grainSynthesisLayersFromTargetDensityNonLayeredFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_fixed_radius");
+      grainSynthesisLayersFromTargetDensityHalfPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_half");
+      grainSynthesisLayersFromTargetDensityHalfFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_half_fixed_radius");
+      grainSynthesisLayersFromTargetDensityNonLayeredHalfPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_half");
+      grainSynthesisLayersFromTargetDensityNonLayeredHalfFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_half_fixed_radius");
+      grainSynthesisLayersFromTargetDensityTexturePipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_r16_texture_array");
+      grainSynthesisLayersFromTargetDensityTextureFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_r16_texture_array_fixed_radius");
+      grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_r16_texture_array");
+      grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_r16_texture_array_fixed_radius");
+      grainSynthesisResolveDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_resolve_density");
+      frameConstantsPipeline = makePipeline(@"spektrafilm_frame_constants");
+      finalFromFilmDensityPipeline = makePipeline(@"spektrafilm_final_from_film_density");
+      printRawFromFilmDensityPipeline = makePipeline(@"spektrafilm_print_raw_from_film_density");
+      finalFromPrintRawPipeline = makePipeline(@"spektrafilm_final_from_print_raw");
+      scannerBlurXPipeline = makePipeline(@"spektrafilm_scanner_blur_x");
+      scannerBlurYPipeline = makePipeline(@"spektrafilm_scanner_blur_y");
+      unsharpBlurXPipeline = makePipeline(@"spektrafilm_unsharp_blur_x");
+      unsharpBlurYPipeline = makePipeline(@"spektrafilm_unsharp_blur_y");
+      bufferToTexturePipeline = makePipeline(@"spektrafilm_buffer_to_texture");
+      textureToBufferPipeline = makePipeline(@"spektrafilm_texture_to_buffer");
+      scannerBlurXTexturePipeline = makePipeline(@"spektrafilm_scanner_blur_x_texture");
+      scannerBlurYTexturePipeline = makePipeline(@"spektrafilm_scanner_blur_y_texture");
+      unsharpBlurXTexturePipeline = makePipeline(@"spektrafilm_unsharp_blur_x_texture");
+      unsharpBlurYTexturePipeline = makePipeline(@"spektrafilm_unsharp_blur_y_texture");
+      scannerFinalizePipeline = makePipeline(@"spektrafilm_scanner_finalize");
+      scannerFinalizeTexturePipeline = makePipeline(@"spektrafilm_scanner_finalize_texture");
+      if (!enlargerResamplePipeline ||
+          !grainPipeline || !halationRawExposurePipeline || !halationScatterCoreBlurXPipeline ||
+          !halationScatterCoreBlurYPipeline || !halationScatterTailBlurXPipeline || !halationScatterTailBlurYPipeline ||
+          !halationScatterResolvePipeline || !halationClearPipeline || !halationBounceBlurXPipeline ||
+          !halationBounceBlurYAccumulatePipeline || !halationResolveLogRawPipeline || !halationResolveDensityPipeline ||
+          !rawToLogRawPipeline || !developFromRawPipeline ||
+          !diffusionComponentBlurXPipeline || !diffusionComponentBlurYAccumulatePipeline ||
+          !diffusionGroupBlurXPipeline || !diffusionGroupBlurYAccumulatePipeline || !diffusionResolvePipeline ||
+          !developFromLogRawPipeline ||
+          !dirCorrectionFromDensityPipeline || !copyBufferPipeline ||
+          !dirBaselinePipeline || !dirBlurXPipeline || !dirBlurYPipeline || !dirRedevelopPipeline ||
+          !previewGrainFromDensityPipeline || !productionGrainLayersFromDensityPipeline ||
+          !grainLayerBlurXPipeline || !grainLayerBlurYPipeline ||
+          !grainMicroSourcePipeline || !grainMicroBlurXPipeline || !grainMicroBlurYPipeline || !grainResolveDensityPipeline ||
+          !grainDensityBlurXPipeline || !grainDensityBlurYPipeline ||
+          !grainSynthesisLayersFromDensityPipeline || !grainSynthesisLayersFromDensityFixedRadiusPipeline ||
+          !grainSynthesisTargetDensityPipeline || !grainSynthesisTargetDensityNonLayeredPipeline ||
+          !grainSynthesisTargetDensityHalfPipeline || !grainSynthesisTargetDensityNonLayeredHalfPipeline ||
+          !grainSynthesisTargetDensityTexturePipeline || !grainSynthesisTargetDensityNonLayeredTexturePipeline ||
+          !grainSynthesisLayersFromTargetDensityPipeline || !grainSynthesisLayersFromTargetDensityFixedRadiusPipeline ||
+          !grainSynthesisLayersFromTargetDensityNonLayeredPipeline ||
+          !grainSynthesisLayersFromTargetDensityNonLayeredFixedRadiusPipeline ||
+          !grainSynthesisLayersFromTargetDensityHalfPipeline ||
+          !grainSynthesisLayersFromTargetDensityHalfFixedRadiusPipeline ||
+          !grainSynthesisLayersFromTargetDensityNonLayeredHalfPipeline ||
+          !grainSynthesisLayersFromTargetDensityNonLayeredHalfFixedRadiusPipeline ||
+          !grainSynthesisLayersFromTargetDensityTexturePipeline ||
+          !grainSynthesisLayersFromTargetDensityTextureFixedRadiusPipeline ||
+          !grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline ||
+          !grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline ||
+          !grainSynthesisResolveDensityPipeline ||
+          !frameConstantsPipeline || !finalFromFilmDensityPipeline ||
+          !printRawFromFilmDensityPipeline || !finalFromPrintRawPipeline ||
+          !scannerBlurXPipeline || !scannerBlurYPipeline || !unsharpBlurXPipeline || !unsharpBlurYPipeline ||
+          !bufferToTexturePipeline || !textureToBufferPipeline || !scannerBlurXTexturePipeline ||
+          !scannerBlurYTexturePipeline || !unsharpBlurXTexturePipeline || !unsharpBlurYTexturePipeline ||
+          !scannerFinalizePipeline || !scannerFinalizeTexturePipeline) {
+        return;
+      }
+
+      const HanatosSpectraLutInfo &hanatos = hanatosSpectraLutInfo();
+      NSURL *hanatosURL = findBundleResourceURL(@"SpektraHanatos2025Spectra", @"f32");
+      if (!hanatosURL) {
+        lastError = "Unable to locate SpektraHanatos2025Spectra.f32 in bundle resources.";
+        return;
+      }
+      NSData *hanatosData = [NSData dataWithContentsOfURL:hanatosURL options:NSDataReadingMappedIfSafe error:&error];
+      const NSUInteger expectedBytes = static_cast<NSUInteger>(hanatos.elementCount) * sizeof(float);
+      if (!hanatosData || [hanatosData length] != expectedBytes) {
+        lastError = error ? [[error localizedDescription] UTF8String] : "Unable to load Hanatos spectra LUT resource.";
+        return;
+      }
+      const float *hanatosFloats = static_cast<const float *>([hanatosData bytes]);
+      hanatosSpectraData.assign(hanatosFloats, hanatosFloats + hanatos.elementCount);
+      spectralInfo.hanatosWidth = hanatos.width;
+      spectralInfo.hanatosHeight = hanatos.height;
+      spectralInfo.hanatosWavelengthCount = hanatos.wavelengthCount;
+    }
+  }
+};
+
+MetalRenderer::MetalRenderer() : impl_(std::make_unique<Impl>()) {}
+
+MetalRenderer::~MetalRenderer() = default;
+
+bool MetalRenderer::isAvailable() const {
+  return impl_ && impl_->device && impl_->commandQueue && impl_->enlargerResamplePipeline && impl_->grainPipeline &&
+    impl_->halationRawExposurePipeline && impl_->halationScatterCoreBlurXPipeline &&
+    impl_->halationScatterCoreBlurYPipeline && impl_->halationScatterTailBlurXPipeline &&
+    impl_->halationScatterTailBlurYPipeline && impl_->halationScatterResolvePipeline &&
+    impl_->halationClearPipeline && impl_->halationBounceBlurXPipeline &&
+    impl_->halationBounceBlurYAccumulatePipeline && impl_->halationResolveLogRawPipeline &&
+    impl_->halationResolveDensityPipeline && impl_->rawToLogRawPipeline && impl_->developFromRawPipeline &&
+    impl_->diffusionComponentBlurXPipeline &&
+    impl_->diffusionComponentBlurYAccumulatePipeline &&
+    impl_->diffusionGroupBlurXPipeline && impl_->diffusionGroupBlurYAccumulatePipeline && impl_->diffusionResolvePipeline &&
+    impl_->developFromLogRawPipeline && impl_->dirCorrectionFromDensityPipeline && impl_->copyBufferPipeline &&
+    impl_->dirBaselinePipeline && impl_->dirBlurXPipeline && impl_->dirBlurYPipeline && impl_->dirRedevelopPipeline &&
+    impl_->previewGrainFromDensityPipeline && impl_->productionGrainLayersFromDensityPipeline &&
+    impl_->grainLayerBlurXPipeline && impl_->grainLayerBlurYPipeline &&
+    impl_->grainMicroSourcePipeline && impl_->grainMicroBlurXPipeline && impl_->grainMicroBlurYPipeline &&
+    impl_->grainResolveDensityPipeline && impl_->grainDensityBlurXPipeline && impl_->grainDensityBlurYPipeline &&
+    impl_->grainSynthesisLayersFromDensityPipeline && impl_->grainSynthesisLayersFromDensityFixedRadiusPipeline &&
+    impl_->grainSynthesisTargetDensityPipeline && impl_->grainSynthesisTargetDensityNonLayeredPipeline &&
+    impl_->grainSynthesisTargetDensityHalfPipeline &&
+    impl_->grainSynthesisTargetDensityNonLayeredHalfPipeline &&
+    impl_->grainSynthesisTargetDensityTexturePipeline &&
+    impl_->grainSynthesisTargetDensityNonLayeredTexturePipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityFixedRadiusPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityNonLayeredPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityNonLayeredFixedRadiusPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityHalfPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityHalfFixedRadiusPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityNonLayeredHalfPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityNonLayeredHalfFixedRadiusPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityTexturePipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityTextureFixedRadiusPipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline &&
+    impl_->grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline &&
+    impl_->grainSynthesisResolveDensityPipeline &&
+    impl_->frameConstantsPipeline && impl_->finalFromFilmDensityPipeline && impl_->printRawFromFilmDensityPipeline &&
+    impl_->finalFromPrintRawPipeline && impl_->scannerBlurXPipeline && impl_->scannerBlurYPipeline &&
+    impl_->unsharpBlurXPipeline && impl_->unsharpBlurYPipeline &&
+    impl_->bufferToTexturePipeline && impl_->textureToBufferPipeline &&
+    impl_->scannerBlurXTexturePipeline && impl_->scannerBlurYTexturePipeline &&
+    impl_->unsharpBlurXTexturePipeline && impl_->unsharpBlurYTexturePipeline &&
+    impl_->scannerFinalizePipeline && impl_->scannerFinalizeTexturePipeline &&
+    !impl_->hanatosSpectraData.empty();
+}
+
+const std::string &MetalRenderer::lastError() const {
+  static const std::string empty;
+  return impl_ ? impl_->lastError : empty;
+}
+
+const MetalRenderDiagnostics &MetalRenderer::lastDiagnostics() const {
+  static const MetalRenderDiagnostics empty;
+  return impl_ ? impl_->diagnostics : empty;
+}
+
+bool MetalRenderer::render(
+  const ImageView &source,
+  const MutableImageView &destination,
+  const RenderWindow &window,
+  const RenderParams &params,
+  double time
+) {
+  if (!isAvailable()) {
+    return false;
+  }
+  if (!isSupportedRgba(source, destination)) {
+    impl_->lastError = "Only RGBA 16-bit half and 32-bit float images are supported by the current Metal path.";
+    return false;
+  }
+
+  const int32_t width = window.x2 - window.x1;
+  const int32_t height = window.y2 - window.y1;
+  if (width <= 0 || height <= 0) {
+    return true;
+  }
+
+  std::lock_guard<std::mutex> renderLock(impl_->renderMutex);
+  @autoreleasepool {
+    const auto renderStart = PerfClock::now();
+    impl_->diagnostics = {};
+    impl_->diagnostics.renderSerialized = true;
+    impl_->diagnostics.privateScratchEnabled = impl_->preferPrivateScratch;
+    impl_->diagnostics.passGpuTimingEnabled = impl_->passGpuTimingEnabled;
+    impl_->diagnostics.diffusionGroupSize = impl_->diffusionGroupSize;
+    impl_->diagnostics.threadgroupMode = impl_->threadgroupMode;
+    impl_->diagnostics.scannerTextureIntermediates = false;
+    impl_->diagnostics.passTimingMode = "off";
+    const NSUInteger pixelBytes = sizeof(float) * 4;
+    const NSUInteger bufferBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * pixelBytes;
+    impl_->beginScratchFrame();
+    if (!impl_->prepareStaticResources(params)) {
+      return false;
+    }
+    const StaticProfileResources &resources = impl_->staticResources;
+    const ProfileCurveSet *filmCurves = resources.filmCurves;
+    const NSUInteger densityCurveBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 3u * sizeof(float);
+    const bool densityOutput = params.renderOutput == RenderOutputMode::FilmDensityCmy;
+    const bool densityWithGrainOutput = params.renderOutput == RenderOutputMode::FilmDensityCmyWithGrain;
+    const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
+    const bool finalPrintSimulation = finalOutput && params.process == ProcessMode::PrintSimulation;
+    const bool finalScanNegative = finalOutput && params.process == ProcessMode::ScanNegative;
+    const bool finalPostProcessPath = finalPrintSimulation || finalScanNegative;
+    const bool cameraDiffusionRequested =
+      params.cameraDiffusionEnabled &&
+      params.cameraDiffusionStrength > 0.0f &&
+      params.cameraDiffusionSpatialScale > 0.0f;
+    const bool printDiffusionRequested =
+      params.printDiffusionEnabled &&
+      params.printDiffusionStrength > 0.0f &&
+      params.printDiffusionSpatialScale > 0.0f &&
+      finalPrintSimulation;
+    const bool needsFilmDensityPath = densityOutput || densityWithGrainOutput || finalPrintSimulation || finalScanNegative;
+    const bool needsHalationLogRawPath = true;
+    const bool halationPath =
+      params.halationEnabled &&
+      needsHalationLogRawPath &&
+      (params.scatterAmount > 0.0f || params.halationAmount > 0.0f);
+    const bool dirPath = params.dirCouplersAmount > 0.0f && needsFilmDensityPath;
+    const bool productionGrainPath =
+      params.grainEnabled &&
+      params.grainModel == GrainModel::Production &&
+      (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+    const bool grainSynthesisPath =
+      params.grainEnabled &&
+      params.grainModel == GrainModel::GrainSynthesis &&
+      (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+    const NSUInteger grainLayerBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * 9u * sizeof(float);
+    const float pixelSizeUm = filmFormatMm(params.filmFormat) * 1000.0f /
+      static_cast<float>(std::max(width, height)) / enlargerScale(params);
+    KernelDiffusionInfo cameraDiffusionInfo{};
+    KernelDiffusionInfo printDiffusionInfo{};
+    const std::vector<KernelDiffusionComponent> cameraDiffusionComponents = cameraDiffusionRequested
+      ? makeDiffusionComponents(
+          {params.cameraDiffusionFamily, params.cameraDiffusionStrength, params.cameraDiffusionSpatialScale,
+           params.cameraDiffusionHaloWarmth, params.cameraDiffusionCoreIntensity, params.cameraDiffusionCoreSize,
+           params.cameraDiffusionHaloIntensity, params.cameraDiffusionHaloSize, params.cameraDiffusionBloomIntensity,
+           params.cameraDiffusionBloomSize},
+          pixelSizeUm,
+          cameraDiffusionInfo
+        )
+      : std::vector<KernelDiffusionComponent>{};
+    const std::vector<KernelDiffusionComponent> printDiffusionComponents = printDiffusionRequested
+      ? makeDiffusionComponents(
+          {params.printDiffusionFamily, params.printDiffusionStrength, params.printDiffusionSpatialScale,
+           params.printDiffusionHaloWarmth, params.printDiffusionCoreIntensity, params.printDiffusionCoreSize,
+           params.printDiffusionHaloIntensity, params.printDiffusionHaloSize, params.printDiffusionBloomIntensity,
+           params.printDiffusionBloomSize},
+          pixelSizeUm,
+          printDiffusionInfo
+        )
+      : std::vector<KernelDiffusionComponent>{};
+    const bool cameraDiffusionPath = cameraDiffusionRequested && cameraDiffusionInfo.componentCount > 0u && !cameraDiffusionComponents.empty();
+    const bool printDiffusionPath = printDiffusionRequested && printDiffusionInfo.componentCount > 0u && !printDiffusionComponents.empty();
+    const bool sourceTransformPath = enlargerTransformActive(params);
+    const bool preExposurePath =
+      cameraDiffusionPath || halationPath || printDiffusionPath || finalPostProcessPath ||
+      densityOutput || densityWithGrainOutput;
+    impl_->diagnostics.halationPath = halationPath;
+    impl_->diagnostics.cameraDiffusionPath = cameraDiffusionPath;
+    impl_->diagnostics.printDiffusionPath = printDiffusionPath;
+    impl_->diagnostics.dirPath = dirPath;
+    impl_->diagnostics.productionGrainPath = productionGrainPath;
+    impl_->diagnostics.grainSynthesisPath = grainSynthesisPath;
+    impl_->diagnostics.finalPostProcessPath = finalPostProcessPath;
+    const bool previewGrainFromDensityPath =
+      (dirPath || preExposurePath) &&
+      params.grainEnabled &&
+      params.grainModel == GrainModel::Preview &&
+      (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+    const KernelDirInfo dirInfo = makeDirInfo(*filmCurves, params);
+    const std::vector<float> dirCorrectedDensityCurves = dirPath
+      ? makeDirCorrectedDensityCurves(*filmCurves, dirInfo)
+      : std::vector<float>{};
+    id<MTLBuffer> curveInfoBuffer = resources.curveInfoBuffer;
+    id<MTLBuffer> logExposureBuffer = resources.logExposureBuffer;
+    id<MTLBuffer> densityCurvesBuffer = resources.densityCurvesBuffer;
+    id<MTLBuffer> spectralInfoBuffer = resources.spectralInfoBuffer;
+    id<MTLBuffer> wavelengthsBuffer = resources.wavelengthsBuffer;
+    id<MTLBuffer> logSensitivityBuffer = resources.logSensitivityBuffer;
+    id<MTLBuffer> bandpassHanatosBuffer = resources.bandpassHanatosBuffer;
+    id<MTLBuffer> hanatosRawResponseBuffer = resources.hanatosRawResponseBuffer;
+    id<MTLBuffer> mallettBasisIlluminantBuffer = resources.mallettBasisIlluminantBuffer;
+    id<MTLBuffer> inputToReferenceXyzBuffer = resources.inputToReferenceXyzBuffer;
+    id<MTLBuffer> inputToSrgbBuffer = resources.inputToSrgbBuffer;
+    id<MTLBuffer> colorInfoBuffer = resources.colorInfoBuffer;
+    id<MTLBuffer> colorDecodeLutBuffer = resources.colorDecodeLutBuffer;
+    id<MTLBuffer> colorTransferKindBuffer = resources.colorTransferKindBuffer;
+    id<MTLBuffer> paperCurveInfoBuffer = resources.paperCurveInfoBuffer;
+    id<MTLBuffer> paperLogExposureBuffer = resources.paperLogExposureBuffer;
+    id<MTLBuffer> paperDensityCurvesBuffer = resources.paperDensityCurvesBuffer;
+    id<MTLBuffer> filmChannelDensityBuffer = resources.filmChannelDensityBuffer;
+    id<MTLBuffer> filmBaseDensityBuffer = resources.filmBaseDensityBuffer;
+    id<MTLBuffer> paperLogSensitivityBuffer = resources.paperLogSensitivityBuffer;
+    id<MTLBuffer> thKg3IlluminantBuffer = resources.thKg3IlluminantBuffer;
+    id<MTLBuffer> customEnlargerFiltersBuffer = resources.customEnlargerFiltersBuffer;
+    id<MTLBuffer> neutralPrintFiltersBuffer = resources.neutralPrintFiltersBuffer;
+    id<MTLBuffer> academyPrinterDensityDataBuffer = resources.academyPrinterDensityDataBuffer;
+    id<MTLBuffer> paperScanDensityDataBuffer = resources.paperScanDensityDataBuffer;
+    id<MTLBuffer> scanIlluminantsAndCmfsBuffer = resources.scanIlluminantsAndCmfsBuffer;
+    id<MTLBuffer> scanToOutputRgbDataBuffer = resources.scanToOutputRgbDataBuffer;
+    id<MTLBuffer> colorEncodeLutBuffer = resources.colorEncodeLutBuffer;
+
+    id<MTLBuffer> srcBuffer = nil;
+    id<MTLBuffer> dstBuffer = nil;
+    bool sourceWrappedDirectly = false;
+    bool destinationWrappedDirectly = false;
+    if (const void *directSource = contiguousFloatWindowPointer(source, window, width, height)) {
+      srcBuffer = [impl_->device newBufferWithBytesNoCopy:const_cast<void *>(directSource)
+                                                   length:bufferBytes
+                                                  options:MTLResourceStorageModeShared
+                                              deallocator:nil];
+      sourceWrappedDirectly = srcBuffer != nil;
+    }
+    if (!srcBuffer) {
+      srcBuffer = impl_->sharedScratchBuffer(bufferBytes, "source staging");
+    }
+    if (void *directDestination = contiguousFloatWindowPointer(destination, window, width, height)) {
+      dstBuffer = [impl_->device newBufferWithBytesNoCopy:directDestination
+                                                   length:bufferBytes
+                                                  options:MTLResourceStorageModeShared
+                                              deallocator:nil];
+      destinationWrappedDirectly = dstBuffer != nil;
+    }
+    impl_->diagnostics.sourceNoCopy = sourceWrappedDirectly;
+    impl_->diagnostics.destinationNoCopy = destinationWrappedDirectly;
+    if (!dstBuffer) {
+      dstBuffer = impl_->sharedScratchBuffer(bufferBytes, "destination staging");
+    }
+    id<MTLBuffer> paramBuffer = impl_->sharedScratchBuffer(sizeof(KernelParams), "kernel params");
+    id<MTLBuffer> enlargedSourceBuffer = sourceTransformPath ? impl_->gpuScratchBuffer(bufferBytes, "enlarger source") : nil;
+
+    const bool scannerNeedsBlur = finalPostProcessPath && params.scannerEnabled && params.scannerMtf50LpMm > 0.0f;
+    const bool scannerNeedsUnsharp = finalPostProcessPath && params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f;
+    const bool scannerTexturePath = impl_->useScannerTextures && (scannerNeedsBlur || scannerNeedsUnsharp);
+    const bool directFinalEncodePath = finalPostProcessPath && !scannerNeedsBlur && !scannerNeedsUnsharp;
+    impl_->diagnostics.scannerTextureIntermediates = scannerTexturePath;
+    const bool needsFrameConstants = needsFilmDensityPath || printDiffusionPath;
+    const NSUInteger diffusionTempBytes = bufferBytes * static_cast<NSUInteger>(std::max(impl_->diffusionGroupSize, 1u));
+    id<MTLBuffer> frameConstantsBuffer = needsFrameConstants ? impl_->gpuScratchBuffer(sizeof(float) * 16u, "frame constants") : nil;
+    id<MTLBuffer> scannerRgbBufferA = (finalPostProcessPath && !directFinalEncodePath) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb A") : nil;
+    id<MTLBuffer> scannerRgbBufferB = (!scannerTexturePath && (scannerNeedsBlur || scannerNeedsUnsharp)) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb B") : nil;
+    id<MTLBuffer> scannerRgbBufferC = (!scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb C") : nil;
+    id<MTLTexture> scannerTextureA = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture A") : nil;
+    id<MTLTexture> scannerTextureB = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture B") : nil;
+    id<MTLTexture> scannerTextureC = (scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchTexture(width, height, "scanner texture C") : nil;
+    id<MTLBuffer> halationRawBufferA = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw A") : nil;
+    id<MTLBuffer> halationRawBufferB = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw B") : nil;
+    id<MTLBuffer> halationRawBufferC = preExposurePath ? impl_->gpuScratchBuffer(cameraDiffusionPath ? diffusionTempBytes : bufferBytes, "pre-exposure raw C") : nil;
+    id<MTLBuffer> halationRawBufferD = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw D") : nil;
+    id<MTLBuffer> halationLogRawBuffer = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure log raw") : nil;
+    id<MTLBuffer> halationDensityBufferA = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density A") : nil;
+    id<MTLBuffer> halationDensityBufferB = (preExposurePath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density B") : nil;
+    id<MTLBuffer> cameraDiffusionInfoBuffer = cameraDiffusionPath ? impl_->sharedScratchBuffer(sizeof(KernelDiffusionInfo), "camera diffusion info") : nil;
+    id<MTLBuffer> cameraDiffusionComponentsBuffer = cameraDiffusionPath && !cameraDiffusionComponents.empty()
+      ? impl_->sharedScratchBuffer(cameraDiffusionComponents.size() * sizeof(KernelDiffusionComponent), "camera diffusion components")
+      : nil;
+    id<MTLBuffer> printDiffusionInfoBuffer = printDiffusionPath ? impl_->sharedScratchBuffer(sizeof(KernelDiffusionInfo), "print diffusion info") : nil;
+    id<MTLBuffer> printDiffusionComponentsBuffer = printDiffusionPath && !printDiffusionComponents.empty()
+      ? impl_->sharedScratchBuffer(printDiffusionComponents.size() * sizeof(KernelDiffusionComponent), "print diffusion components")
+      : nil;
+    id<MTLBuffer> printRawBufferA = printDiffusionPath ? impl_->gpuScratchBuffer(bufferBytes, "print raw A") : nil;
+    id<MTLBuffer> printRawBufferB = printDiffusionPath ? impl_->gpuScratchBuffer(diffusionTempBytes, "print raw B") : nil;
+    id<MTLBuffer> printRawBufferC = printDiffusionPath ? impl_->gpuScratchBuffer(bufferBytes, "print raw C") : nil;
+    id<MTLBuffer> dirInfoBuffer = dirPath ? impl_->sharedScratchBuffer(sizeof(KernelDirInfo), "DIR info") : nil;
+    id<MTLBuffer> dirCorrectedDensityCurvesBuffer = dirPath ? impl_->sharedScratchBuffer(densityCurveBytes, "DIR corrected curves") : nil;
+    id<MTLBuffer> dirLogRawBuffer = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR log raw") : nil;
+    id<MTLBuffer> dirDensityBufferA = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR density A") : nil;
+    id<MTLBuffer> dirDensityBufferB = (dirPath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "DIR density B") : nil;
+    id<MTLBuffer> dirCorrectionBufferA = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction A") : nil;
+    id<MTLBuffer> dirCorrectionBufferB = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction B") : nil;
+    id<MTLBuffer> grainLayerBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer A") : nil;
+    id<MTLBuffer> grainLayerBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer B") : nil;
+    id<MTLBuffer> grainMicroBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro A") : nil;
+    id<MTLBuffer> grainMicroBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro B") : nil;
+    id<MTLBuffer> grainDensityBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density A") : nil;
+    id<MTLBuffer> grainDensityBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density B") : nil;
+    const bool optimizedGrainSynthesisPath = grainSynthesisPath && !impl_->useLegacyGrainSynthesis;
+    const bool halfGrainSynthesisTargetPath = optimizedGrainSynthesisPath &&
+      impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::HalfBuffer;
+    const bool textureGrainSynthesisTargetPath = optimizedGrainSynthesisPath &&
+      impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::R16TextureArray;
+    id<MTLBuffer> grainSynthesisTargetHalfBuffer = halfGrainSynthesisTargetPath
+      ? impl_->gpuScratchBuffer(static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) *
+          kGrainSynthesisComponentCount * sizeof(uint16_t), "grain synthesis target half")
+      : nil;
+    id<MTLTexture> grainSynthesisTargetTexture = textureGrainSynthesisTargetPath
+      ? impl_->gpuScratchTextureArray(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height),
+          kGrainSynthesisComponentCount, "grain synthesis target R16 array")
+      : nil;
+    id<MTLBuffer> grainSynthesisComponentInfoBuffer = optimizedGrainSynthesisPath
+      ? impl_->sharedScratchBuffer(sizeof(KernelGrainSynthesisComponentInfo) * kGrainSynthesisComponentCount, "grain synthesis component info")
+      : nil;
+    id<MTLBuffer> grainSynthesisSampleOffsetBuffer = optimizedGrainSynthesisPath
+      ? impl_->sharedScratchBuffer(sizeof(KernelGrainSynthesisSampleOffset) * kGrainSynthesisComponentCount * kGrainSynthesisMaxSamples, "grain synthesis sample offsets")
+      : nil;
+    id<MTLBuffer> grainSynthesisRadiusLutBuffer = optimizedGrainSynthesisPath
+      ? impl_->sharedScratchBuffer(sizeof(float) * kGrainSynthesisComponentCount * kGrainSynthesisMaxRadiusLutSize, "grain synthesis radius LUT")
+      : nil;
+    id<MTLBuffer> grainSynthesisCellOffsetBuffer = optimizedGrainSynthesisPath
+      ? impl_->sharedScratchBuffer(sizeof(KernelGrainSynthesisCellOffset) * kGrainSynthesisComponentCount * kGrainSynthesisMaxCellOffsetsPerComponent, "grain synthesis cell offsets")
+      : nil;
+    if (!srcBuffer || !dstBuffer || !paramBuffer || (needsFrameConstants && !frameConstantsBuffer) ||
+        (sourceTransformPath && !enlargedSourceBuffer)) {
+      impl_->lastError = "Unable to allocate Metal staging buffers.";
+      return false;
+    }
+    if (productionGrainPath && (!grainLayerBufferA || !grainLayerBufferB || !grainMicroBufferA || !grainMicroBufferB ||
+        !grainDensityBufferA || !grainDensityBufferB)) {
+      impl_->lastError = "Unable to allocate production grain Metal buffers.";
+      return false;
+    }
+    if (grainSynthesisPath && (!grainLayerBufferA || !grainLayerBufferB || !grainMicroBufferA || !grainMicroBufferB ||
+        !grainDensityBufferA || !grainDensityBufferB)) {
+      impl_->lastError = "Unable to allocate grain synthesis Metal buffers.";
+      return false;
+    }
+    if (optimizedGrainSynthesisPath && (!grainSynthesisComponentInfoBuffer || !grainSynthesisSampleOffsetBuffer ||
+        !grainSynthesisRadiusLutBuffer || !grainSynthesisCellOffsetBuffer ||
+        (halfGrainSynthesisTargetPath && !grainSynthesisTargetHalfBuffer) ||
+        (textureGrainSynthesisTargetPath && !grainSynthesisTargetTexture))) {
+      impl_->lastError = "Unable to allocate optimized grain synthesis Metal buffers.";
+      return false;
+    }
+    if (dirPath && (!dirInfoBuffer || !dirCorrectedDensityCurvesBuffer || !dirLogRawBuffer || !dirDensityBufferA ||
+        !dirCorrectionBufferA || !dirCorrectionBufferB || (previewGrainFromDensityPath && !dirDensityBufferB))) {
+      impl_->lastError = "Unable to allocate DIR coupler Metal buffers.";
+      return false;
+    }
+    if (preExposurePath && (!halationRawBufferA || !halationRawBufferB || !halationRawBufferC || !halationRawBufferD ||
+        !halationLogRawBuffer || !halationDensityBufferA || (previewGrainFromDensityPath && !halationDensityBufferB))) {
+      impl_->lastError = "Unable to allocate pre-development Metal buffers.";
+      return false;
+    }
+    if (cameraDiffusionPath && (!cameraDiffusionInfoBuffer || !cameraDiffusionComponentsBuffer)) {
+      impl_->lastError = "Unable to allocate camera diffusion Metal buffers.";
+      return false;
+    }
+    if (printDiffusionPath && (!printDiffusionInfoBuffer || !printDiffusionComponentsBuffer ||
+        !printRawBufferA || !printRawBufferB || !printRawBufferC)) {
+      impl_->lastError = "Unable to allocate print diffusion Metal buffers.";
+      return false;
+    }
+    if (finalPostProcessPath && !directFinalEncodePath && !scannerRgbBufferA) {
+      impl_->lastError = "Unable to allocate scanner post-process Metal buffers.";
+      return false;
+    }
+    if (!scannerTexturePath && (scannerNeedsBlur || scannerNeedsUnsharp) && !scannerRgbBufferB) {
+      impl_->lastError = "Unable to allocate scanner post-process Metal buffers.";
+      return false;
+    }
+    if (scannerTexturePath && (!scannerTextureA || !scannerTextureB || (scannerNeedsUnsharp && !scannerTextureC))) {
+      impl_->lastError = "Unable to allocate scanner post-process Metal textures.";
+      return false;
+    }
+    if (!scannerTexturePath && scannerNeedsUnsharp && !scannerRgbBufferC) {
+      impl_->lastError = "Unable to allocate scanner post-process Metal buffers.";
+      return false;
+    }
+
+    if (!sourceWrappedDirectly) {
+      const auto sourceCopyStart = PerfClock::now();
+      copySourceToFloatStaging(source, window, width, height, static_cast<float *>([srcBuffer contents]));
+      impl_->diagnostics.sourceCopyMs += elapsedMilliseconds(sourceCopyStart, PerfClock::now());
+      impl_->diagnostics.uploadBytes += bufferBytes;
+    }
+
+    KernelParams kernelParams = toKernelParams(params, time, width, height);
+    applyProfileHalationDefaults(kernelParams, params, *filmCurves);
+    if (params.autoExposure) {
+      kernelParams.autoExposureEv = measureAutoExposureEv(static_cast<const float *>([srcBuffer contents]), width, height, params);
+    }
+    std::memcpy([paramBuffer contents], &kernelParams, sizeof(kernelParams));
+    impl_->diagnostics.uploadBytes += sizeof(kernelParams);
+    if (optimizedGrainSynthesisPath) {
+      std::array<KernelGrainSynthesisComponentInfo, kGrainSynthesisComponentCount> componentInfo{};
+      std::array<KernelGrainSynthesisSampleOffset, kGrainSynthesisComponentCount * kGrainSynthesisMaxSamples> sampleOffsets{};
+      std::vector<float> radiusLut;
+      std::vector<KernelGrainSynthesisCellOffset> cellOffsets;
+      buildGrainSynthesisTables(
+        kernelParams,
+        impl_->grainSynthesisSamplerMode,
+        impl_->grainSynthesisRadiusLutSize,
+        impl_->grainSynthesisCellMode,
+        componentInfo,
+        sampleOffsets,
+        radiusLut,
+        cellOffsets
+      );
+      std::memcpy([grainSynthesisComponentInfoBuffer contents], componentInfo.data(), componentInfo.size() * sizeof(componentInfo[0]));
+      std::memcpy([grainSynthesisSampleOffsetBuffer contents], sampleOffsets.data(), sampleOffsets.size() * sizeof(sampleOffsets[0]));
+      if (!radiusLut.empty()) {
+        std::memcpy([grainSynthesisRadiusLutBuffer contents], radiusLut.data(), radiusLut.size() * sizeof(radiusLut[0]));
+      }
+      if (!cellOffsets.empty()) {
+        std::memcpy([grainSynthesisCellOffsetBuffer contents], cellOffsets.data(), cellOffsets.size() * sizeof(cellOffsets[0]));
+      }
+      impl_->diagnostics.uploadBytes += componentInfo.size() * sizeof(componentInfo[0]) +
+        sampleOffsets.size() * sizeof(sampleOffsets[0]) +
+        radiusLut.size() * sizeof(radiusLut[0]) +
+        cellOffsets.size() * sizeof(cellOffsets[0]);
+    }
+    if (dirPath) {
+      std::memcpy([dirInfoBuffer contents], &dirInfo, sizeof(dirInfo));
+      std::memcpy([dirCorrectedDensityCurvesBuffer contents], dirCorrectedDensityCurves.data(), densityCurveBytes);
+      impl_->diagnostics.uploadBytes += sizeof(dirInfo) + densityCurveBytes;
+    }
+    if (cameraDiffusionPath) {
+      std::memcpy([cameraDiffusionInfoBuffer contents], &cameraDiffusionInfo, sizeof(cameraDiffusionInfo));
+      std::memcpy([cameraDiffusionComponentsBuffer contents], cameraDiffusionComponents.data(), cameraDiffusionComponents.size() * sizeof(KernelDiffusionComponent));
+      impl_->diagnostics.uploadBytes += sizeof(cameraDiffusionInfo) +
+        cameraDiffusionComponents.size() * sizeof(KernelDiffusionComponent);
+    }
+    if (printDiffusionPath) {
+      std::memcpy([printDiffusionInfoBuffer contents], &printDiffusionInfo, sizeof(printDiffusionInfo));
+      std::memcpy([printDiffusionComponentsBuffer contents], printDiffusionComponents.data(), printDiffusionComponents.size() * sizeof(KernelDiffusionComponent));
+      impl_->diagnostics.uploadBytes += sizeof(printDiffusionInfo) +
+        printDiffusionComponents.size() * sizeof(KernelDiffusionComponent);
+    }
+
+    const auto commandEncodingStart = PerfClock::now();
+    id<MTLCommandBuffer> commandBuffer = nil;
+    id<MTLComputeCommandEncoder> encoder = nil;
+    bool encodeFailed = false;
+    auto beginCommandEncoder = [&]() -> bool {
+      commandBuffer = [impl_->commandQueue commandBuffer];
+      encoder = [commandBuffer computeCommandEncoder];
+      if (!commandBuffer || !encoder) {
+        impl_->lastError = "Unable to create Metal command encoder.";
+        return false;
+      }
+      return true;
+    };
+    if (!beginCommandEncoder()) {
+      return false;
+    }
+
+    constexpr NSUInteger kMaxCounterSamples = 2048u;
+    id<MTLCounterSampleBuffer> passCounterBuffer = nil;
+    const std::string requestedPassTiming = impl_->passTimingMode;
+    const bool counterTimingRequested =
+      requestedPassTiming == "auto" || requestedPassTiming == "counter";
+    bool useSplitPassTiming = requestedPassTiming == "split";
+    if (impl_->passGpuTimingEnabled && counterTimingRequested && impl_->supportsDispatchCounterSampling()) {
+      if (@available(macOS 10.15, *)) {
+        id<MTLCounterSet> counterSet = impl_->timestampCounterSet();
+        if (counterSet) {
+          MTLCounterSampleBufferDescriptor *descriptor = [MTLCounterSampleBufferDescriptor new];
+          descriptor.counterSet = counterSet;
+          descriptor.storageMode = MTLStorageModeShared;
+          descriptor.sampleCount = kMaxCounterSamples;
+          descriptor.label = @"SpektraFilm per-pass timestamps";
+          NSError *counterError = nil;
+          passCounterBuffer = [impl_->device newCounterSampleBufferWithDescriptor:descriptor error:&counterError];
+          impl_->diagnostics.passGpuTimingAvailable = passCounterBuffer != nil;
+          if (passCounterBuffer) {
+            impl_->diagnostics.passTimingMode = "counter";
+          }
+        }
+      }
+    }
+    if (!passCounterBuffer && requestedPassTiming == "auto") {
+      useSplitPassTiming = true;
+    }
+    if (useSplitPassTiming) {
+      impl_->diagnostics.passGpuTimingAvailable = true;
+      impl_->diagnostics.passTimingMode = "split";
+    } else if (impl_->passGpuTimingEnabled && !passCounterBuffer) {
+      impl_->diagnostics.passTimingMode = "unavailable";
+    }
+    uint32_t dims[2] = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+    double splitCommandMs = 0.0;
+
+    auto recordPass = [&](id<MTLComputePipelineState> pipeline, uint32_t depth, NSUInteger tgWidth, NSUInteger tgHeight, uint64_t estimatedBytes) -> size_t {
+      MetalPassDiagnostics pass{};
+      pass.name = impl_->pipelineName(pipeline);
+      pass.width = static_cast<uint32_t>(width);
+      pass.height = static_cast<uint32_t>(height);
+      pass.depth = depth;
+      pass.threadgroupWidth = static_cast<uint32_t>(tgWidth);
+      pass.threadgroupHeight = static_cast<uint32_t>(tgHeight);
+      pass.estimatedBytes = estimatedBytes;
+      impl_->diagnostics.passes.push_back(pass);
+      return impl_->diagnostics.passes.size() - 1u;
+    };
+
+    auto samplePassCounter = [&](NSUInteger sampleIndex) {
+      if (passCounterBuffer && sampleIndex < kMaxCounterSamples) {
+        [encoder sampleCountersInBuffer:passCounterBuffer atSampleIndex:sampleIndex withBarrier:YES];
+      }
+    };
+
+    auto finishSplitTimedPass = [&](size_t passIndex, PerfClock::time_point passStart) {
+      if (!useSplitPassTiming || encodeFailed) {
+        return;
+      }
+      [encoder endEncoding];
+      [commandBuffer commit];
+      [commandBuffer waitUntilCompleted];
+      const double passMs = elapsedMilliseconds(passStart, PerfClock::now());
+      splitCommandMs += passMs;
+      if ([commandBuffer status] == MTLCommandBufferStatusError) {
+        NSError *error = [commandBuffer error];
+        impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
+        encodeFailed = true;
+        return;
+      }
+      if (passIndex < impl_->diagnostics.passes.size()) {
+        impl_->diagnostics.passes[passIndex].gpuMs = passMs;
+        impl_->diagnostics.passes[passIndex].gpuTimeAvailable = true;
+      }
+      if (!beginCommandEncoder()) {
+        encodeFailed = true;
+      }
+    };
+
+    auto dispatch2D = [&](id<MTLComputePipelineState> pipeline, uint64_t estimatedBytes = 0u) {
+      if (encodeFailed) {
+        return;
+      }
+      NSUInteger tw = 32;
+      NSUInteger th = 8;
+      if (impl_->forcedThreadgroupWidth > 0u && impl_->forcedThreadgroupHeight > 0u) {
+        tw = impl_->forcedThreadgroupWidth;
+        th = impl_->forcedThreadgroupHeight;
+      }
+      const NSUInteger maxThreadsPerGroup = std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup);
+      tw = std::min<NSUInteger>(tw, maxThreadsPerGroup);
+      if (tw * th > maxThreadsPerGroup) {
+        th = std::max<NSUInteger>(1, maxThreadsPerGroup / tw);
+      }
+      MTLSize threadsPerGroup = MTLSizeMake(tw, th, 1);
+      MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
+      const size_t passIndex = recordPass(pipeline, 1u, threadsPerGroup.width, threadsPerGroup.height, estimatedBytes ? estimatedBytes : static_cast<uint64_t>(bufferBytes) * 2u);
+      const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
+      samplePassCounter(startSample);
+      const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      samplePassCounter(startSample + 1u);
+      impl_->diagnostics.passCount += 1u;
+      finishSplitTimedPass(passIndex, splitPassStart);
+    };
+    auto dispatch3DDepth = [&](id<MTLComputePipelineState> pipeline, uint32_t depth, uint64_t estimatedBytes = 0u) {
+      if (encodeFailed) {
+        return;
+      }
+      NSUInteger tgWidth = impl_->forcedThreadgroupWidth > 0u ? impl_->forcedThreadgroupWidth : 8;
+      NSUInteger tgHeight = impl_->forcedThreadgroupHeight > 0u ? impl_->forcedThreadgroupHeight : 8;
+      if (tgWidth * tgHeight > pipeline.maxTotalThreadsPerThreadgroup) {
+        tgHeight = std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tgWidth);
+      }
+      MTLSize threadsPerGroup = MTLSizeMake(tgWidth, tgHeight, 1);
+      MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), depth);
+      const uint64_t defaultBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * depth * sizeof(float) * 2u;
+      const size_t passIndex = recordPass(pipeline, depth, threadsPerGroup.width, threadsPerGroup.height, estimatedBytes ? estimatedBytes : defaultBytes);
+      const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
+      samplePassCounter(startSample);
+      const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      samplePassCounter(startSample + 1u);
+      impl_->diagnostics.passCount += 1u;
+      finishSplitTimedPass(passIndex, splitPassStart);
+    };
+    auto dispatch3D = [&](id<MTLComputePipelineState> pipeline, uint64_t estimatedBytes = 0u) {
+      dispatch3DDepth(pipeline, 9u, estimatedBytes ? estimatedBytes : static_cast<uint64_t>(grainLayerBytes) * 2u);
+    };
+    auto dispatch1D = [&](id<MTLComputePipelineState> pipeline, NSUInteger threadCount, uint64_t estimatedBytes = 0u) {
+      if (encodeFailed) {
+        return;
+      }
+      const NSUInteger tgWidth = std::min<NSUInteger>(std::max<NSUInteger>(pipeline.threadExecutionWidth, 1u), threadCount);
+      MTLSize threadsPerGroup = MTLSizeMake(tgWidth, 1, 1);
+      MTLSize threads = MTLSizeMake(threadCount, 1, 1);
+      const size_t passIndex = recordPass(pipeline, 1u, threadsPerGroup.width, threadsPerGroup.height, estimatedBytes);
+      const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
+      samplePassCounter(startSample);
+      const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      samplePassCounter(startSample + 1u);
+      impl_->diagnostics.passCount += 1u;
+      finishSplitTimedPass(passIndex, splitPassStart);
+    };
+
+    id<MTLBuffer> renderSourceBuffer = srcBuffer;
+    if (sourceTransformPath) {
+      [encoder setComputePipelineState:impl_->enlargerResamplePipeline];
+      [encoder setBuffer:srcBuffer offset:0 atIndex:0];
+      [encoder setBuffer:enlargedSourceBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->enlargerResamplePipeline);
+      renderSourceBuffer = enlargedSourceBuffer;
+    }
+
+    if (needsFrameConstants) {
+      [encoder setComputePipelineState:impl_->frameConstantsPipeline];
+      [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:0];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:2];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:3];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:4];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:6];
+      [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:7];
+      [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:8];
+      [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:9];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:10];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:11];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:12];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:13];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:14];
+      [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:15];
+      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:16];
+      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:17];
+      [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:18];
+      [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:19];
+      [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:20];
+      [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:21];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:22];
+      [encoder setBuffer:scanIlluminantsAndCmfsBuffer offset:0 atIndex:23];
+      [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:24];
+      dispatch1D(impl_->frameConstantsPipeline, 1u, sizeof(float) * 16u);
+    }
+
+    auto encodeScannerPostProcess = [&](id<MTLBuffer> linearRgbBuffer) {
+      if (scannerTexturePath) {
+        [encoder setComputePipelineState:impl_->bufferToTexturePipeline];
+        [encoder setBuffer:linearRgbBuffer offset:0 atIndex:0];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+        [encoder setTexture:scannerTextureA atIndex:0];
+        dispatch2D(impl_->bufferToTexturePipeline);
+
+        id<MTLTexture> currentTexture = scannerTextureA;
+        if (params.scannerEnabled && params.scannerMtf50LpMm > 0.0f) {
+          [encoder setComputePipelineState:impl_->scannerBlurXTexturePipeline];
+          [encoder setTexture:currentTexture atIndex:0];
+          [encoder setTexture:scannerTextureB atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+          dispatch2D(impl_->scannerBlurXTexturePipeline);
+
+          [encoder setComputePipelineState:impl_->scannerBlurYTexturePipeline];
+          [encoder setTexture:scannerTextureB atIndex:0];
+          [encoder setTexture:scannerTextureA atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+          dispatch2D(impl_->scannerBlurYTexturePipeline);
+          currentTexture = scannerTextureA;
+        }
+
+        id<MTLTexture> unsharpBlurTexture = currentTexture;
+        if (params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f) {
+          [encoder setComputePipelineState:impl_->unsharpBlurXTexturePipeline];
+          [encoder setTexture:currentTexture atIndex:0];
+          [encoder setTexture:scannerTextureB atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+          dispatch2D(impl_->unsharpBlurXTexturePipeline);
+
+          [encoder setComputePipelineState:impl_->unsharpBlurYTexturePipeline];
+          [encoder setTexture:scannerTextureB atIndex:0];
+          [encoder setTexture:scannerTextureC atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+          dispatch2D(impl_->unsharpBlurYTexturePipeline);
+          unsharpBlurTexture = scannerTextureC;
+        }
+
+        [encoder setComputePipelineState:impl_->scannerFinalizeTexturePipeline];
+        [encoder setTexture:currentTexture atIndex:0];
+        [encoder setTexture:unsharpBlurTexture atIndex:1];
+        [encoder setBuffer:dstBuffer offset:0 atIndex:0];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+        [encoder setBuffer:colorInfoBuffer offset:0 atIndex:3];
+        [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:4];
+        [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:5];
+        dispatch2D(impl_->scannerFinalizeTexturePipeline);
+        return;
+      }
+
+      id<MTLBuffer> currentBuffer = linearRgbBuffer;
+      if (params.scannerEnabled && params.scannerMtf50LpMm > 0.0f) {
+        [encoder setComputePipelineState:impl_->scannerBlurXPipeline];
+        [encoder setBuffer:currentBuffer offset:0 atIndex:0];
+        [encoder setBuffer:scannerRgbBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->scannerBlurXPipeline);
+
+        [encoder setComputePipelineState:impl_->scannerBlurYPipeline];
+        [encoder setBuffer:scannerRgbBufferB offset:0 atIndex:0];
+        [encoder setBuffer:scannerRgbBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->scannerBlurYPipeline);
+        currentBuffer = scannerRgbBufferA;
+      }
+
+      id<MTLBuffer> unsharpBlurBuffer = currentBuffer;
+      if (params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f) {
+        [encoder setComputePipelineState:impl_->unsharpBlurXPipeline];
+        [encoder setBuffer:currentBuffer offset:0 atIndex:0];
+        [encoder setBuffer:scannerRgbBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->unsharpBlurXPipeline);
+
+        [encoder setComputePipelineState:impl_->unsharpBlurYPipeline];
+        [encoder setBuffer:scannerRgbBufferB offset:0 atIndex:0];
+        [encoder setBuffer:scannerRgbBufferC offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->unsharpBlurYPipeline);
+        unsharpBlurBuffer = scannerRgbBufferC;
+      }
+
+      [encoder setComputePipelineState:impl_->scannerFinalizePipeline];
+      [encoder setBuffer:currentBuffer offset:0 atIndex:0];
+      [encoder setBuffer:unsharpBlurBuffer offset:0 atIndex:1];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:2];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:6];
+      [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:7];
+      dispatch2D(impl_->scannerFinalizePipeline);
+    };
+
+    auto encodeFinalFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
+      const uint32_t encodeOutput = directFinalEncodePath ? 1u : 0u;
+      [encoder setComputePipelineState:impl_->finalFromFilmDensityPipeline];
+      [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
+      [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:6];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:8];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:9];
+      [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:10];
+      [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:11];
+      [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:12];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:13];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:14];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:15];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:16];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:17];
+      [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:18];
+      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:19];
+      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:20];
+      [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:21];
+      [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:22];
+      [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:23];
+      [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:24];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:25];
+      [encoder setBuffer:scanIlluminantsAndCmfsBuffer offset:0 atIndex:26];
+      [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:27];
+      [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:28];
+      [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:29];
+      [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:30];
+      dispatch2D(impl_->finalFromFilmDensityPipeline);
+      if (finalPostProcessPath && !directFinalEncodePath) {
+        encodeScannerPostProcess(scannerRgbBufferA);
+      }
+    };
+
+    auto encodeCopyBufferToDestination = [&](id<MTLBuffer> sourceBuffer) {
+      [encoder setComputePipelineState:impl_->copyBufferPipeline];
+      [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(impl_->copyBufferPipeline);
+    };
+
+    auto encodeDevelopFromLogRaw = [&](id<MTLBuffer> logRawBuffer, id<MTLBuffer> densityBuffer) {
+      [encoder setComputePipelineState:impl_->developFromLogRawPipeline];
+      [encoder setBuffer:logRawBuffer offset:0 atIndex:0];
+      [encoder setBuffer:densityBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:6];
+      dispatch2D(impl_->developFromLogRawPipeline);
+    };
+
+    auto encodeDevelopFromRaw = [&](id<MTLBuffer> rawBuffer, id<MTLBuffer> densityBuffer) {
+      [encoder setComputePipelineState:impl_->developFromRawPipeline];
+      [encoder setBuffer:rawBuffer offset:0 atIndex:0];
+      [encoder setBuffer:densityBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:6];
+      dispatch2D(impl_->developFromRawPipeline);
+    };
+
+    auto encodeHalationResolveDensity = [&](id<MTLBuffer> rawBuffer, id<MTLBuffer> halationBuffer, id<MTLBuffer> densityBuffer) {
+      [encoder setComputePipelineState:impl_->halationResolveDensityPipeline];
+      [encoder setBuffer:rawBuffer offset:0 atIndex:0];
+      [encoder setBuffer:halationBuffer offset:0 atIndex:1];
+      [encoder setBuffer:densityBuffer offset:0 atIndex:2];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:6];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:7];
+      dispatch2D(impl_->halationResolveDensityPipeline);
+    };
+
+    auto encodeProductionGrainLayersFromDensity = [&](id<MTLBuffer> densityBuffer) {
+      [encoder setComputePipelineState:impl_->productionGrainLayersFromDensityPipeline];
+      [encoder setBuffer:densityBuffer offset:0 atIndex:0];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:7];
+      dispatch3D(impl_->productionGrainLayersFromDensityPipeline);
+    };
+
+    id<MTLBuffer> grainSynthesisDensitySource = nil;
+    auto encodeGrainSynthesisLayersFromDensity = [&](id<MTLBuffer> densityBuffer) {
+      grainSynthesisDensitySource = densityBuffer;
+      id<MTLComputePipelineState> pipeline = params.grainSynthesisRadiusStdDevRatio <= 1.0e-6f
+        ? impl_->grainSynthesisLayersFromDensityFixedRadiusPipeline
+        : impl_->grainSynthesisLayersFromDensityPipeline;
+      [encoder setComputePipelineState:pipeline];
+      [encoder setBuffer:densityBuffer offset:0 atIndex:0];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:7];
+      dispatch3D(pipeline);
+    };
+
+    auto encodeOptimizedGrainSynthesisLayersFromDensity = [&](id<MTLBuffer> densityBuffer) {
+      grainSynthesisDensitySource = densityBuffer;
+      const bool layered = params.grainSynthesisLayered;
+      const bool fixedRadius = params.grainSynthesisRadiusStdDevRatio <= 1.0e-6f;
+      const bool halfTarget = impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::HalfBuffer;
+      const bool textureTarget = impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::R16TextureArray;
+      id<MTLBuffer> targetBuffer = halfTarget ? grainSynthesisTargetHalfBuffer : grainLayerBufferB;
+      id<MTLComputePipelineState> targetPipeline = nil;
+      if (textureTarget) {
+        targetPipeline = layered
+          ? impl_->grainSynthesisTargetDensityTexturePipeline
+          : impl_->grainSynthesisTargetDensityNonLayeredTexturePipeline;
+      } else if (halfTarget) {
+        targetPipeline = layered
+          ? impl_->grainSynthesisTargetDensityHalfPipeline
+          : impl_->grainSynthesisTargetDensityNonLayeredHalfPipeline;
+      } else {
+        targetPipeline = layered
+          ? impl_->grainSynthesisTargetDensityPipeline
+          : impl_->grainSynthesisTargetDensityNonLayeredPipeline;
+      }
+      [encoder setComputePipelineState:targetPipeline];
+      [encoder setBuffer:densityBuffer offset:0 atIndex:0];
+      if (textureTarget) {
+        [encoder setTexture:grainSynthesisTargetTexture atIndex:0];
+      } else {
+        [encoder setBuffer:targetBuffer offset:0 atIndex:1];
+      }
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:7];
+      dispatch3DDepth(targetPipeline, layered ? 9u : 3u);
+      if (textureTarget && !encodeFailed) {
+        [encoder memoryBarrierWithScope:MTLBarrierScopeTextures];
+      }
+
+      id<MTLComputePipelineState> synthesisPipeline = nil;
+      if (textureTarget) {
+        if (layered) {
+          synthesisPipeline = fixedRadius
+            ? impl_->grainSynthesisLayersFromTargetDensityTextureFixedRadiusPipeline
+            : impl_->grainSynthesisLayersFromTargetDensityTexturePipeline;
+        } else {
+          synthesisPipeline = fixedRadius
+            ? impl_->grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline
+            : impl_->grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline;
+        }
+      } else if (halfTarget) {
+        if (layered) {
+          synthesisPipeline = fixedRadius
+            ? impl_->grainSynthesisLayersFromTargetDensityHalfFixedRadiusPipeline
+            : impl_->grainSynthesisLayersFromTargetDensityHalfPipeline;
+        } else {
+          synthesisPipeline = fixedRadius
+            ? impl_->grainSynthesisLayersFromTargetDensityNonLayeredHalfFixedRadiusPipeline
+            : impl_->grainSynthesisLayersFromTargetDensityNonLayeredHalfPipeline;
+        }
+      } else {
+        if (layered) {
+          synthesisPipeline = fixedRadius
+            ? impl_->grainSynthesisLayersFromTargetDensityFixedRadiusPipeline
+            : impl_->grainSynthesisLayersFromTargetDensityPipeline;
+        } else {
+          synthesisPipeline = fixedRadius
+            ? impl_->grainSynthesisLayersFromTargetDensityNonLayeredFixedRadiusPipeline
+            : impl_->grainSynthesisLayersFromTargetDensityNonLayeredPipeline;
+        }
+      }
+      [encoder setComputePipelineState:synthesisPipeline];
+      if (textureTarget) {
+        [encoder setTexture:grainSynthesisTargetTexture atIndex:0];
+      } else {
+        [encoder setBuffer:targetBuffer offset:0 atIndex:0];
+      }
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:grainSynthesisComponentInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:grainSynthesisSampleOffsetBuffer offset:0 atIndex:5];
+      [encoder setBuffer:grainSynthesisRadiusLutBuffer offset:0 atIndex:6];
+      [encoder setBuffer:grainSynthesisCellOffsetBuffer offset:0 atIndex:7];
+      dispatch3DDepth(synthesisPipeline, layered ? 9u : 3u);
+    };
+
+    auto encodeSelectedGrainSynthesisLayersFromDensity = [&](id<MTLBuffer> densityBuffer) {
+      if (optimizedGrainSynthesisPath) {
+        encodeOptimizedGrainSynthesisLayersFromDensity(densityBuffer);
+      } else {
+        encodeGrainSynthesisLayersFromDensity(densityBuffer);
+      }
+    };
+
+    auto encodeDiffusion = [&](id<MTLBuffer> sourceBuffer, id<MTLBuffer> destinationBuffer,
+                               id<MTLBuffer> tempBuffer, id<MTLBuffer> accumBuffer,
+                               id<MTLBuffer> infoBuffer, id<MTLBuffer> componentsBuffer,
+                               uint32_t componentCount) {
+      [encoder setComputePipelineState:impl_->halationClearPipeline];
+      [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(impl_->halationClearPipeline);
+
+      const uint32_t groupSize = std::max(impl_->diffusionGroupSize, 1u);
+      for (uint32_t component = 0; component < componentCount; component += groupSize) {
+        const uint32_t groupCount = std::min(groupSize, componentCount - component);
+        if (groupSize == 1u) {
+          [encoder setComputePipelineState:impl_->diffusionComponentBlurXPipeline];
+          [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+          [encoder setBuffer:tempBuffer offset:0 atIndex:1];
+          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          dispatch2D(impl_->diffusionComponentBlurXPipeline);
+
+          [encoder setComputePipelineState:impl_->diffusionComponentBlurYAccumulatePipeline];
+          [encoder setBuffer:tempBuffer offset:0 atIndex:0];
+          [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          dispatch2D(impl_->diffusionComponentBlurYAccumulatePipeline);
+        } else {
+          const uint32_t componentRange[2] = {component, groupCount};
+          [encoder setComputePipelineState:impl_->diffusionGroupBlurXPipeline];
+          [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+          [encoder setBuffer:tempBuffer offset:0 atIndex:1];
+          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+          dispatch2D(impl_->diffusionGroupBlurXPipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+
+          [encoder setComputePipelineState:impl_->diffusionGroupBlurYAccumulatePipeline];
+          [encoder setBuffer:tempBuffer offset:0 atIndex:0];
+          [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+          dispatch2D(impl_->diffusionGroupBlurYAccumulatePipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+        }
+      }
+
+      [encoder setComputePipelineState:impl_->diffusionResolvePipeline];
+      [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+      [encoder setBuffer:destinationBuffer offset:0 atIndex:2];
+      [encoder setBuffer:infoBuffer offset:0 atIndex:3];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+      dispatch2D(impl_->diffusionResolvePipeline);
+    };
+
+    auto encodeFinalFromPrintRaw = [&](id<MTLBuffer> printRawBuffer) {
+      const uint32_t encodeOutput = directFinalEncodePath ? 1u : 0u;
+      [encoder setComputePipelineState:impl_->finalFromPrintRawPipeline];
+      [encoder setBuffer:printRawBuffer offset:0 atIndex:0];
+      [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:6];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:8];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:9];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:10];
+      [encoder setBuffer:scanIlluminantsAndCmfsBuffer offset:0 atIndex:11];
+      [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:12];
+      [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:13];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:14];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:15];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:16];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:17];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:18];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:19];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:20];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:21];
+      [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:22];
+      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:23];
+      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:24];
+      [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:25];
+      [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:26];
+      [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:27];
+      [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:28];
+      [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:29];
+      [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:30];
+      dispatch2D(impl_->finalFromPrintRawPipeline);
+      if (finalPostProcessPath && !directFinalEncodePath) {
+        encodeScannerPostProcess(scannerRgbBufferA);
+      }
+    };
+
+    auto encodePrintDiffusionFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
+      [encoder setComputePipelineState:impl_->printRawFromFilmDensityPipeline];
+      [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
+      [encoder setBuffer:printRawBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:6];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:8];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:9];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:10];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:11];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:12];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:13];
+      [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:14];
+      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:15];
+      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:16];
+      [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:17];
+      [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:18];
+      [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:19];
+      [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:20];
+      [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:21];
+      dispatch2D(impl_->printRawFromFilmDensityPipeline);
+
+      encodeDiffusion(
+        printRawBufferA,
+        printRawBufferB,
+        printRawBufferB,
+        printRawBufferC,
+        printDiffusionInfoBuffer,
+        printDiffusionComponentsBuffer,
+        printDiffusionInfo.componentCount
+      );
+      encodeFinalFromPrintRaw(printRawBufferB);
+    };
+
+    auto encodeFinalFilmDensityOrPrintDiffusion = [&](id<MTLBuffer> filmDensityBuffer) {
+      if (densityOutput || densityWithGrainOutput) {
+        encodeCopyBufferToDestination(filmDensityBuffer);
+      } else if (printDiffusionPath) {
+        encodePrintDiffusionFromFilmDensity(filmDensityBuffer);
+      } else {
+        encodeFinalFromFilmDensity(filmDensityBuffer);
+      }
+    };
+
+    if (preExposurePath) {
+      [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
+      [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:halationRawBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:5];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:6];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:7];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:8];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:9];
+      [encoder setBuffer:inputToSrgbBuffer offset:0 atIndex:10];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:11];
+      [encoder setBuffer:colorDecodeLutBuffer offset:0 atIndex:12];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:13];
+      dispatch2D(impl_->halationRawExposurePipeline);
+
+      id<MTLBuffer> currentRawBuffer = halationRawBufferA;
+      if (cameraDiffusionPath) {
+        encodeDiffusion(
+          halationRawBufferA,
+          halationRawBufferB,
+          halationRawBufferC,
+          halationRawBufferD,
+          cameraDiffusionInfoBuffer,
+          cameraDiffusionComponentsBuffer,
+          cameraDiffusionInfo.componentCount
+        );
+        currentRawBuffer = halationRawBufferB;
+      }
+
+      if (halationPath && params.scatterAmount > 0.0f && params.scatterScale > 0.0f) {
+        id<MTLBuffer> scatterTempBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
+        id<MTLBuffer> scatterCoreBuffer = halationRawBufferC;
+        id<MTLBuffer> scatterAccumBuffer = halationRawBufferD;
+        id<MTLBuffer> scatterResolvedBuffer = scatterTempBuffer;
+
+        [encoder setComputePipelineState:impl_->halationScatterCoreBlurXPipeline];
+        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:scatterTempBuffer offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->halationScatterCoreBlurXPipeline);
+
+        [encoder setComputePipelineState:impl_->halationScatterCoreBlurYPipeline];
+        [encoder setBuffer:scatterTempBuffer offset:0 atIndex:0];
+        [encoder setBuffer:scatterCoreBuffer offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->halationScatterCoreBlurYPipeline);
+
+        [encoder setComputePipelineState:impl_->halationClearPipeline];
+        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:1];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+        dispatch2D(impl_->halationClearPipeline);
+
+        for (uint32_t component = 0; component < 3u; ++component) {
+          [encoder setComputePipelineState:impl_->halationScatterTailBlurXPipeline];
+          [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+          [encoder setBuffer:scatterTempBuffer offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          dispatch2D(impl_->halationScatterTailBlurXPipeline);
+
+          [encoder setComputePipelineState:impl_->halationScatterTailBlurYPipeline];
+          [encoder setBuffer:scatterTempBuffer offset:0 atIndex:0];
+          [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          dispatch2D(impl_->halationScatterTailBlurYPipeline);
+        }
+
+        [encoder setComputePipelineState:impl_->halationScatterResolvePipeline];
+        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:scatterCoreBuffer offset:0 atIndex:1];
+        [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:2];
+        [encoder setBuffer:scatterResolvedBuffer offset:0 atIndex:3];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:4];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:5];
+        dispatch2D(impl_->halationScatterResolvePipeline);
+        currentRawBuffer = scatterResolvedBuffer;
+      }
+
+      const bool needsPreExposureLogRaw = dirPath;
+      bool preExposureDensityReady = false;
+      if (halationPath) {
+        id<MTLBuffer> bounceAccumBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
+        [encoder setComputePipelineState:impl_->halationClearPipeline];
+        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:bounceAccumBuffer offset:0 atIndex:1];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+        dispatch2D(impl_->halationClearPipeline);
+
+        for (uint32_t bounce = 0; bounce < 3u; ++bounce) {
+          [encoder setComputePipelineState:impl_->halationBounceBlurXPipeline];
+          [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+          [encoder setBuffer:halationRawBufferD offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&bounce length:sizeof(bounce) atIndex:4];
+          dispatch2D(impl_->halationBounceBlurXPipeline);
+
+          [encoder setComputePipelineState:impl_->halationBounceBlurYAccumulatePipeline];
+          [encoder setBuffer:halationRawBufferD offset:0 atIndex:0];
+          [encoder setBuffer:bounceAccumBuffer offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&bounce length:sizeof(bounce) atIndex:4];
+          dispatch2D(impl_->halationBounceBlurYAccumulatePipeline);
+        }
+
+        if (needsPreExposureLogRaw) {
+          [encoder setComputePipelineState:impl_->halationResolveLogRawPipeline];
+          [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+          [encoder setBuffer:bounceAccumBuffer offset:0 atIndex:1];
+          [encoder setBuffer:halationLogRawBuffer offset:0 atIndex:2];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+          dispatch2D(impl_->halationResolveLogRawPipeline);
+        } else {
+          encodeHalationResolveDensity(currentRawBuffer, bounceAccumBuffer, halationDensityBufferA);
+          preExposureDensityReady = true;
+        }
+      } else {
+        if (needsPreExposureLogRaw) {
+          [encoder setComputePipelineState:impl_->rawToLogRawPipeline];
+          [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+          [encoder setBuffer:halationLogRawBuffer offset:0 atIndex:1];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+          dispatch2D(impl_->rawToLogRawPipeline);
+        } else {
+          encodeDevelopFromRaw(currentRawBuffer, halationDensityBufferA);
+          preExposureDensityReady = true;
+        }
+      }
+
+      if (!preExposureDensityReady) {
+        encodeDevelopFromLogRaw(halationLogRawBuffer, halationDensityBufferA);
+      }
+      if (dirPath) {
+          [encoder setComputePipelineState:impl_->dirCorrectionFromDensityPipeline];
+          [encoder setBuffer:halationDensityBufferA offset:0 atIndex:0];
+          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+          [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:3];
+          [encoder setBuffer:dirInfoBuffer offset:0 atIndex:4];
+          dispatch2D(impl_->dirCorrectionFromDensityPipeline);
+
+          [encoder setComputePipelineState:impl_->dirBlurXPipeline];
+          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:0];
+          [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          dispatch2D(impl_->dirBlurXPipeline);
+
+          [encoder setComputePipelineState:impl_->dirBlurYPipeline];
+          [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
+          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          dispatch2D(impl_->dirBlurYPipeline);
+
+          [encoder setComputePipelineState:impl_->dirRedevelopPipeline];
+          [encoder setBuffer:halationLogRawBuffer offset:0 atIndex:0];
+          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+          [encoder setBuffer:halationDensityBufferA offset:0 atIndex:2];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+          [encoder setBuffer:curveInfoBuffer offset:0 atIndex:5];
+          [encoder setBuffer:logExposureBuffer offset:0 atIndex:6];
+          [encoder setBuffer:dirCorrectedDensityCurvesBuffer offset:0 atIndex:7];
+          dispatch2D(impl_->dirRedevelopPipeline);
+        }
+
+      if (productionGrainPath) {
+        encodeProductionGrainLayersFromDensity(halationDensityBufferA);
+      } else if (grainSynthesisPath) {
+        encodeSelectedGrainSynthesisLayersFromDensity(halationDensityBufferA);
+      } else if (previewGrainFromDensityPath) {
+        [encoder setComputePipelineState:impl_->previewGrainFromDensityPipeline];
+        [encoder setBuffer:halationDensityBufferA offset:0 atIndex:0];
+        [encoder setBuffer:halationDensityBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+        dispatch2D(impl_->previewGrainFromDensityPipeline);
+        encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferB);
+      } else {
+        encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferA);
+      }
+    } else if (dirPath) {
+      [encoder setComputePipelineState:impl_->dirBaselinePipeline];
+      [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dirLogRawBuffer offset:0 atIndex:1];
+      [encoder setBuffer:dirDensityBufferA offset:0 atIndex:2];
+      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:3];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:4];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:5];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:6];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:7];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:8];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:9];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:10];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:11];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:12];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:13];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:14];
+      [encoder setBuffer:inputToSrgbBuffer offset:0 atIndex:15];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:16];
+      [encoder setBuffer:colorDecodeLutBuffer offset:0 atIndex:17];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:18];
+      [encoder setBuffer:dirInfoBuffer offset:0 atIndex:19];
+      dispatch2D(impl_->dirBaselinePipeline);
+
+      [encoder setComputePipelineState:impl_->dirBlurXPipeline];
+      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:0];
+      [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->dirBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->dirBlurYPipeline];
+      [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
+      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->dirBlurYPipeline);
+
+      [encoder setComputePipelineState:impl_->dirRedevelopPipeline];
+      [encoder setBuffer:dirLogRawBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+      [encoder setBuffer:dirDensityBufferA offset:0 atIndex:2];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:6];
+      [encoder setBuffer:dirCorrectedDensityCurvesBuffer offset:0 atIndex:7];
+      dispatch2D(impl_->dirRedevelopPipeline);
+
+      if (productionGrainPath) {
+        encodeProductionGrainLayersFromDensity(dirDensityBufferA);
+      } else if (grainSynthesisPath) {
+        encodeSelectedGrainSynthesisLayersFromDensity(dirDensityBufferA);
+      } else if (previewGrainFromDensityPath) {
+        [encoder setComputePipelineState:impl_->previewGrainFromDensityPipeline];
+        [encoder setBuffer:dirDensityBufferA offset:0 atIndex:0];
+        [encoder setBuffer:dirDensityBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+        dispatch2D(impl_->previewGrainFromDensityPipeline);
+        encodeFinalFilmDensityOrPrintDiffusion(dirDensityBufferB);
+      } else {
+        encodeFinalFilmDensityOrPrintDiffusion(dirDensityBufferA);
+      }
+    }
+
+    if ((dirPath || preExposurePath) && !productionGrainPath && !grainSynthesisPath) {
+      // Final output was encoded by the precomputed film-density branch.
+    } else if (productionGrainPath) {
+      if (!dirPath && !preExposurePath) {
+        [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
+        [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
+        [encoder setBuffer:grainDensityBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:5];
+        [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:6];
+        [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:7];
+        [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:8];
+        [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:9];
+        [encoder setBuffer:inputToSrgbBuffer offset:0 atIndex:10];
+        [encoder setBuffer:colorInfoBuffer offset:0 atIndex:11];
+        [encoder setBuffer:colorDecodeLutBuffer offset:0 atIndex:12];
+        [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:13];
+        dispatch2D(impl_->halationRawExposurePipeline);
+
+        encodeDevelopFromRaw(grainDensityBufferA, grainMicroBufferA);
+
+        [encoder setComputePipelineState:impl_->productionGrainLayersFromDensityPipeline];
+        [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+        [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
+        [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:7];
+        dispatch3D(impl_->productionGrainLayersFromDensityPipeline);
+      }
+
+      [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
+      dispatch3D(impl_->grainLayerBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainLayerBlurYPipeline];
+      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:0];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
+      dispatch3D(impl_->grainLayerBlurYPipeline);
+
+      [encoder setComputePipelineState:impl_->grainMicroSourcePipeline];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(impl_->grainMicroSourcePipeline);
+
+      [encoder setComputePipelineState:impl_->grainMicroBlurXPipeline];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainMicroBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainMicroBlurYPipeline];
+      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:0];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainMicroBlurYPipeline);
+
+      [encoder setComputePipelineState:impl_->grainResolveDensityPipeline];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
+      [encoder setBuffer:renderSourceBuffer offset:0 atIndex:2];
+      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:3];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:4];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:5];
+      dispatch2D(impl_->grainResolveDensityPipeline);
+
+      [encoder setComputePipelineState:impl_->grainDensityBlurXPipeline];
+      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainDensityBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainDensityBlurYPipeline];
+      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:0];
+      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainDensityBlurYPipeline);
+
+      encodeFinalFilmDensityOrPrintDiffusion(grainDensityBufferA);
+    } else if (grainSynthesisPath) {
+      if (!dirPath && !preExposurePath) {
+        [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
+        [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
+        [encoder setBuffer:grainDensityBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:5];
+        [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:6];
+        [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:7];
+        [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:8];
+        [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:9];
+        [encoder setBuffer:inputToSrgbBuffer offset:0 atIndex:10];
+        [encoder setBuffer:colorInfoBuffer offset:0 atIndex:11];
+        [encoder setBuffer:colorDecodeLutBuffer offset:0 atIndex:12];
+        [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:13];
+        dispatch2D(impl_->halationRawExposurePipeline);
+
+        encodeDevelopFromRaw(grainDensityBufferA, grainDensityBufferB);
+        encodeSelectedGrainSynthesisLayersFromDensity(grainDensityBufferB);
+      }
+
+      [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
+      dispatch3D(impl_->grainLayerBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainLayerBlurYPipeline];
+      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:0];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
+      dispatch3D(impl_->grainLayerBlurYPipeline);
+
+      [encoder setComputePipelineState:impl_->grainMicroSourcePipeline];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(impl_->grainMicroSourcePipeline);
+
+      [encoder setComputePipelineState:impl_->grainMicroBlurXPipeline];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainMicroBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainMicroBlurYPipeline];
+      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:0];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainMicroBlurYPipeline);
+
+      [encoder setComputePipelineState:impl_->grainSynthesisResolveDensityPipeline];
+      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
+      [encoder setBuffer:grainSynthesisDensitySource offset:0 atIndex:2];
+      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:3];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:4];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:5];
+      dispatch2D(impl_->grainSynthesisResolveDensityPipeline);
+
+      [encoder setComputePipelineState:impl_->grainDensityBlurXPipeline];
+      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:0];
+      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainDensityBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainDensityBlurYPipeline];
+      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:0];
+      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainDensityBlurYPipeline);
+
+      encodeFinalFilmDensityOrPrintDiffusion(grainDensityBufferA);
+    } else {
+      [encoder setComputePipelineState:impl_->grainPipeline];
+      [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:logExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:6];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
+      [encoder setBuffer:logSensitivityBuffer offset:0 atIndex:8];
+      [encoder setBuffer:bandpassHanatosBuffer offset:0 atIndex:9];
+      [encoder setBuffer:hanatosRawResponseBuffer offset:0 atIndex:10];
+      [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:11];
+      [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:12];
+      [encoder setBuffer:inputToSrgbBuffer offset:0 atIndex:13];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:14];
+      [encoder setBuffer:colorDecodeLutBuffer offset:0 atIndex:15];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:16];
+      [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:17];
+      [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:18];
+      [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:19];
+      [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:20];
+      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:21];
+      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:22];
+      [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:23];
+      [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:24];
+      [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:25];
+      [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:26];
+      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:27];
+      [encoder setBuffer:scanIlluminantsAndCmfsBuffer offset:0 atIndex:28];
+      [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:29];
+      [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:30];
+      dispatch2D(impl_->grainPipeline);
+    }
+    if (encodeFailed) {
+      return false;
+    }
+    if (useSplitPassTiming) {
+      if (encoder) {
+        [encoder endEncoding];
+      }
+      impl_->diagnostics.cpuSetupMs =
+        std::max(0.0, elapsedMilliseconds(renderStart, commandEncodingStart) - impl_->diagnostics.sourceCopyMs);
+      impl_->diagnostics.commandBufferMs = splitCommandMs;
+    } else {
+      const auto commandStart = PerfClock::now();
+      impl_->diagnostics.cpuSetupMs = std::max(0.0, elapsedMilliseconds(renderStart, commandStart) - impl_->diagnostics.sourceCopyMs);
+      [encoder endEncoding];
+      [commandBuffer commit];
+      [commandBuffer waitUntilCompleted];
+      impl_->diagnostics.commandBufferMs = elapsedMilliseconds(commandStart, PerfClock::now());
+
+      if ([commandBuffer status] == MTLCommandBufferStatusError) {
+        NSError *error = [commandBuffer error];
+        impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
+        return false;
+      }
+    }
+
+    if (passCounterBuffer && impl_->diagnostics.passGpuTimingAvailable) {
+      NSData *counterData = [passCounterBuffer resolveCounterRange:NSMakeRange(0, std::min<NSUInteger>(kMaxCounterSamples, impl_->diagnostics.passes.size() * 2u))];
+      const auto *timestamps = static_cast<const MTLCounterResultTimestamp *>([counterData bytes]);
+      if (timestamps) {
+        for (size_t i = 0; i < impl_->diagnostics.passes.size(); ++i) {
+          const NSUInteger startIndex = static_cast<NSUInteger>(i) * 2u;
+          const NSUInteger endIndex = startIndex + 1u;
+          if (endIndex >= kMaxCounterSamples) {
+            break;
+          }
+          const uint64_t start = timestamps[startIndex].timestamp;
+          const uint64_t end = timestamps[endIndex].timestamp;
+          if (start != MTLCounterErrorValue && end != MTLCounterErrorValue && end >= start) {
+            impl_->diagnostics.passes[i].gpuMs = impl_->timestampTicksToMilliseconds(end - start);
+            impl_->diagnostics.passes[i].gpuTimeAvailable = true;
+          }
+        }
+      }
+    }
+
+    if (!destinationWrappedDirectly) {
+      const auto outputCopyStart = PerfClock::now();
+      copyFloatStagingToDestination(static_cast<const float *>([dstBuffer contents]), destination, window, width, height);
+      impl_->diagnostics.outputCopyMs += elapsedMilliseconds(outputCopyStart, PerfClock::now());
+    }
+  }
+  return true;
+}
+
+} // namespace spektrafilm

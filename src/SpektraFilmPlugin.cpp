@@ -1,0 +1,3697 @@
+#include "SpektraMetalRenderer.h"
+#include "SpektraParameters.h"
+#include "SpektraProfileCurves.h"
+#include "SpektraTooltips.h"
+
+#include "ofxImageEffect.h"
+#include "ofxColour.h"
+#include "ofxMemory.h"
+#include "ofxMessage.h"
+#include "ofxMultiThread.h"
+#include "ofxParam.h"
+
+#include <ApplicationServices/ApplicationServices.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <dlfcn.h>
+#include <fstream>
+#include <filesystem>
+#include <iomanip>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <new>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#if defined __APPLE__
+#  define SPEKTRA_EXPORT __attribute__((visibility("default")))
+#else
+#  error SpektraFilm OFX currently builds on macOS only.
+#endif
+
+#ifndef kOfxBitDepthHalf
+#  define kOfxBitDepthHalf "OfxBitDepthHalf"
+#endif
+
+#ifndef SPEKTRAFILM_VERSION_STRING
+#  define SPEKTRAFILM_VERSION_STRING "0.1.0"
+#endif
+
+#ifndef SPEKTRAFILM_PLUGIN_IDENTIFIER
+#  define SPEKTRAFILM_PLUGIN_IDENTIFIER "org.spektrafilm.ofx"
+#endif
+
+#ifndef SPEKTRAFILM_PLUGIN_LABEL
+#  define SPEKTRAFILM_PLUGIN_LABEL "SpektraFilm"
+#endif
+
+#ifndef SPEKTRAFILM_PLUGIN_FLAVOR
+#  define SPEKTRAFILM_PLUGIN_FLAVOR 2
+#endif
+
+namespace {
+
+constexpr const char *kPluginIdentifier = SPEKTRAFILM_PLUGIN_IDENTIFIER;
+constexpr const char *kPluginLabel = SPEKTRAFILM_PLUGIN_LABEL;
+constexpr int kPluginVersionMajor = 0;
+constexpr int kPluginVersionMinor = 1;
+
+OfxHost *gHost = nullptr;
+OfxImageEffectSuiteV1 *gEffectHost = nullptr;
+OfxPropertySuiteV1 *gPropHost = nullptr;
+OfxParameterSuiteV1 *gParamHost = nullptr;
+OfxMessageSuiteV1 *gMessageHost = nullptr;
+int gPluginImageAnchor = 0;
+
+enum class PluginFlavor : int32_t {
+  Flow = 0,
+  Pro = 1,
+  FilmDev = 2,
+};
+
+constexpr PluginFlavor kPluginFlavor = static_cast<PluginFlavor>(SPEKTRAFILM_PLUGIN_FLAVOR);
+
+constexpr const char *svgIconFileForFlavor() {
+  switch (kPluginFlavor) {
+    case PluginFlavor::Flow:
+      return "icons/SpektraFlow.svg";
+    case PluginFlavor::Pro:
+      return "icons/SpektraPro.svg";
+    case PluginFlavor::FilmDev:
+      return "icons/SpektraFilm.svg";
+  }
+  return "icons/SpektraFilm.svg";
+}
+
+constexpr const char *pngIconFileForFlavor() {
+  switch (kPluginFlavor) {
+    case PluginFlavor::Flow:
+      return "icons/SpektraFlow.png";
+    case PluginFlavor::Pro:
+      return "icons/SpektraPro.png";
+    case PluginFlavor::FilmDev:
+      return "icons/SpektraFilm.png";
+  }
+  return "icons/SpektraFilm.png";
+}
+
+enum ParamTag : uint32_t {
+  kParamTagNone = 0u,
+  kParamTagFlow = 1u << 0u,
+  kParamTagDevelopment = 1u << 1u,
+};
+
+struct ParamMetadata {
+  const char *name;
+  const char *parentGroup;
+  uint32_t tags;
+};
+
+constexpr uint32_t flow() {
+  return kParamTagFlow;
+}
+
+constexpr uint32_t development() {
+  return kParamTagDevelopment;
+}
+
+constexpr uint32_t flowDevelopment() {
+  return kParamTagFlow | kParamTagDevelopment;
+}
+
+inline constexpr ParamMetadata kParamMetadata[] = {
+  {"process", "colorGroup", flow()},
+  {"inputColorSpace", "colorGroup", flow()},
+  {"outputRole", "colorGroup", flow()},
+  {"sdrOutputColorSpace", "colorGroup", flow()},
+  {"sceneOutputColorSpace", "colorGroup", development()},
+  {"hdrPreset", "colorGroup", flow()},
+  {"hdrTransfer", "colorGroup", flow()},
+  {"hdrReferenceWhiteNits", "colorGroup", flow()},
+  {"hdrPeakNits", "colorGroup", flow()},
+  {"hdrExposureEv", "colorGroup", flow()},
+  {"hdrToneMapping", "colorGroup", flow()},
+
+  {"cameraUvFilterEnabled", "filteringGroup", kParamTagNone},
+  {"cameraUvCutNm", "filteringGroup", kParamTagNone},
+  {"cameraIrFilterEnabled", "filteringGroup", kParamTagNone},
+  {"cameraIrCutNm", "filteringGroup", kParamTagNone},
+
+  {"rgbToRawMethod", "filmGroup", flow()},
+  {"film", "filmGroup", flow()},
+  {"filmFormat", "filmGroup", flow()},
+  {"filmPushPullMode", "filmGroup", kParamTagNone},
+  {"filmPushPullStops", "filmGroup", flow()},
+  {"negativeBleachBypassAmount", "filmGroup", flowDevelopment()},
+  {"negativeLeucoCyanCoupling", "filmGroup", development()},
+  {"filmExposureEv", "filmGroup", flow()},
+  {"autoExposure", "filmGroup", kParamTagNone},
+  {"autoExposureMethod", "filmGroup", kParamTagNone},
+  {"filmGamma", "filmGroup", development()},
+
+  {"paper", "printGroup", flow()},
+  {"printTiming", "printGroup", flow()},
+  {"printPushPullStops", "printGroup", flow()},
+  {"printBleachBypassAmount", "printGroup", flowDevelopment()},
+  {"printExposureEv", "printGroup", flow()},
+  {"printGamma", "printGroup", development()},
+  {"printShadowShape", "printGroup", flow()},
+  {"printHighlightShape", "printGroup", flow()},
+  {"filterC", "printGroup", flow()},
+  {"filterMShift", "printGroup", flow()},
+  {"filterYShift", "printGroup", flow()},
+  {"preflashExposure", "printGroup", kParamTagNone},
+  {"preflashMFilterShift", "printGroup", kParamTagNone},
+  {"preflashYFilterShift", "printGroup", kParamTagNone},
+  {"printerLightsGang", "printGroup", flow()},
+  {"printerLightsGroup", "printGroup", flow()},
+  {"printerLightR", "printGroup", flow()},
+  {"printerLightG", "printGroup", flow()},
+  {"printerLightB", "printGroup", flow()},
+  {"printerLightCalibration", "printGroup", kParamTagNone},
+
+  {"enlargerScale", "enlargerGroup", kParamTagNone},
+  {"enlargerOffsetXPercent", "enlargerGroup", kParamTagNone},
+  {"enlargerOffsetYPercent", "enlargerGroup", kParamTagNone},
+
+  {"dirAmount", "couplerGroup", flow()},
+  {"dirDiffusionUm", "couplerGroup", flow()},
+  {"dirInhibitionSameLayer", "couplerGroup", flow()},
+  {"dirInhibitionInterlayer", "couplerGroup", flow()},
+  {"dirGammaSameLayerRgb", "couplerGroup", kParamTagNone},
+  {"dirGammaRToGb", "couplerGroup", kParamTagNone},
+  {"dirGammaGToRb", "couplerGroup", kParamTagNone},
+  {"dirGammaBToRg", "couplerGroup", kParamTagNone},
+  {"dirCalibrateToStock", "couplerGroup", kParamTagNone},
+
+  {"grainEnabled", "grainGroup", flow()},
+  {"grainModel", "grainGroup", flow()},
+  {"grainSublayersEnabled", "grainGroup", flow()},
+  {"grainSubLayerCount", "grainGroup", kParamTagNone},
+  {"grainParticleAreaUm2", "grainGroup", flow()},
+  {"grainParticleScale", "grainGroup", kParamTagNone},
+  {"grainParticleScaleLayers", "grainGroup", kParamTagNone},
+  {"grainDensityMin", "grainGroup", kParamTagNone},
+  {"grainUniformity", "grainGroup", kParamTagNone},
+  {"grainFinalBlurUm", "grainGroup", kParamTagNone},
+  {"grainBlurDyeCloudsUm", "grainGroup", kParamTagNone},
+  {"grainMicroStructure", "grainGroup", kParamTagNone},
+  {"grainSeed", "grainGroup", kParamTagNone},
+  {"grainAnimate", "grainGroup", kParamTagNone},
+  {"grainSynthesisSize", "grainGroup", development()},
+  {"grainSynthesisAmount", "grainGroup", development()},
+  {"grainSynthesisSharpness", "grainGroup", development()},
+  {"grainSynthesisQuality", "grainGroup", development()},
+
+  {"grainSynthesisSamples", "grainSynthesisGroup", development()},
+  {"grainSynthesisMeanRadiusUm", "grainSynthesisGroup", development()},
+  {"grainSynthesisRadiusStdDevRatio", "grainSynthesisGroup", development()},
+  {"grainSynthesisObservationSigmaUm", "grainSynthesisGroup", development()},
+  {"grainSynthesisCellSizeRatio", "grainSynthesisGroup", development()},
+  {"grainSynthesisMaxRadiusQuantile", "grainSynthesisGroup", development()},
+  {"grainSynthesisCoverageEpsilon", "grainSynthesisGroup", development()},
+  {"grainSynthesisMaxGrainsPerCell", "grainSynthesisGroup", development()},
+  {"grainSynthesisRadiusScale", "grainSynthesisGroup", development()},
+  {"grainSynthesisLayerScale", "grainSynthesisGroup", development()},
+  {"grainSynthesisLayered", "grainSynthesisGroup", development()},
+
+  {"halationEnabled", "halationGroup", flow()},
+  {"scatterAmount", "halationGroup", kParamTagNone},
+  {"scatterScale", "halationGroup", kParamTagNone},
+  {"halationAmount", "halationGroup", flow()},
+  {"halationScale", "halationGroup", flow()},
+  {"halationStrength", "halationGroup", flow()},
+
+  {"cameraDiffusionEnabled", "diffusionGroup", flow()},
+  {"cameraDiffusionFamily", "diffusionGroup", flow()},
+  {"cameraDiffusionStrength", "diffusionGroup", flow()},
+  {"cameraDiffusionSpatialScale", "diffusionGroup", kParamTagNone},
+  {"cameraDiffusionHaloWarmth", "diffusionGroup", flow()},
+  {"cameraDiffusionCoreIntensity", "diffusionGroup", kParamTagNone},
+  {"cameraDiffusionCoreSize", "diffusionGroup", kParamTagNone},
+  {"cameraDiffusionHaloIntensity", "diffusionGroup", kParamTagNone},
+  {"cameraDiffusionHaloSize", "diffusionGroup", kParamTagNone},
+  {"cameraDiffusionBloomIntensity", "diffusionGroup", kParamTagNone},
+  {"cameraDiffusionBloomSize", "diffusionGroup", kParamTagNone},
+  {"printDiffusionEnabled", "diffusionGroup", flow()},
+  {"printDiffusionFamily", "diffusionGroup", flow()},
+  {"printDiffusionStrength", "diffusionGroup", flow()},
+  {"printDiffusionSpatialScale", "diffusionGroup", kParamTagNone},
+  {"printDiffusionHaloWarmth", "diffusionGroup", flow()},
+  {"printDiffusionCoreIntensity", "diffusionGroup", kParamTagNone},
+  {"printDiffusionCoreSize", "diffusionGroup", kParamTagNone},
+  {"printDiffusionHaloIntensity", "diffusionGroup", kParamTagNone},
+  {"printDiffusionHaloSize", "diffusionGroup", kParamTagNone},
+  {"printDiffusionBloomIntensity", "diffusionGroup", kParamTagNone},
+  {"printDiffusionBloomSize", "diffusionGroup", kParamTagNone},
+
+  {"scannerEnabled", "scannerGroup", flow()},
+  {"scannerWhiteCorrection", "scannerGroup", flow()},
+  {"scannerBlackCorrection", "scannerGroup", flow()},
+  {"scannerWhiteLevel", "scannerGroup", flow()},
+  {"scannerBlackLevel", "scannerGroup", flow()},
+  {"glarePercent", "scannerGroup", kParamTagNone},
+  {"scannerMtf50LpMm", "scannerGroup", kParamTagNone},
+  {"scannerUnsharpRadiusUm", "scannerGroup", kParamTagNone},
+  {"scannerUnsharpAmount", "scannerGroup", kParamTagNone},
+
+  {"infoVersion", "infoGroup", flow()},
+  {"infoCreatedBy", "infoGroup", flow()},
+  {"infoBasedOn", "infoGroup", flow()},
+};
+
+const ParamMetadata *metadataForParam(const char *name) {
+  for (const ParamMetadata &metadata : kParamMetadata) {
+    if (std::strcmp(metadata.name, name) == 0) {
+      return &metadata;
+    }
+  }
+  return nullptr;
+}
+
+bool parameterVisibleInFlavor(const ParamMetadata &metadata) {
+  const bool flowTagged = (metadata.tags & kParamTagFlow) != 0u;
+  const bool developmentTagged = (metadata.tags & kParamTagDevelopment) != 0u;
+  if (kPluginFlavor == PluginFlavor::FilmDev) {
+    return true;
+  }
+  if (kPluginFlavor == PluginFlavor::Pro) {
+    return !developmentTagged;
+  }
+  return flowTagged && !developmentTagged;
+}
+
+bool shouldDefineParam(const char *name) {
+  return true;
+}
+
+bool groupVisibleInFlavor(const char *name) {
+  if (std::strcmp(name, "manageGroup") == 0) {
+    return true;
+  }
+  if (kPluginFlavor == PluginFlavor::FilmDev) {
+    return true;
+  }
+  for (const ParamMetadata &metadata : kParamMetadata) {
+    if (std::strcmp(metadata.parentGroup, name) == 0 && parameterVisibleInFlavor(metadata)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool shouldDefineGroup(const char *name) {
+  return true;
+}
+
+bool parameterVisibleInFlavor(const char *name) {
+  const ParamMetadata *metadata = metadataForParam(name);
+  return !metadata || parameterVisibleInFlavor(*metadata);
+}
+
+bool parameterHiddenInFlavor(const char *name) {
+  return !parameterVisibleInFlavor(name);
+}
+
+constexpr bool flavorAllowsDevelopmentControls() {
+  return kPluginFlavor == PluginFlavor::FilmDev;
+}
+
+constexpr bool flavorAllowsSceneHandoff() {
+  return flavorAllowsDevelopmentControls();
+}
+
+int grainModelOptionCountForFlavor() {
+  return flavorAllowsDevelopmentControls() ? 3 : 2;
+}
+
+constexpr int outputRoleOptionCountForFlavor() {
+  return flavorAllowsSceneHandoff() ? 3 : 2;
+}
+
+spektrafilm::OutputRole outputRoleForFlavor(int value) {
+  switch (static_cast<spektrafilm::OutputRole>(value)) {
+    case spektrafilm::OutputRole::DisplayHdr:
+      return spektrafilm::OutputRole::DisplayHdr;
+    case spektrafilm::OutputRole::SceneHandoff:
+      return flavorAllowsSceneHandoff()
+        ? spektrafilm::OutputRole::SceneHandoff
+        : spektrafilm::OutputRole::DisplaySdr;
+    case spektrafilm::OutputRole::DisplaySdr:
+    default:
+      return spektrafilm::OutputRole::DisplaySdr;
+  }
+}
+
+enum class ParamValueKind : uint8_t {
+  Int = 1,
+  Bool = 2,
+  Double = 3,
+  Double2D = 4,
+  Double3D = 5,
+};
+
+struct ParamDefault {
+  const char *name;
+  ParamValueKind kind;
+  int intDefault;
+  double doubleDefault[3];
+};
+
+constexpr ParamDefault intDefault(const char *name, int value) {
+  return {name, ParamValueKind::Int, value, {0.0, 0.0, 0.0}};
+}
+
+constexpr ParamDefault boolDefault(const char *name, bool value) {
+  return {name, ParamValueKind::Bool, value ? 1 : 0, {0.0, 0.0, 0.0}};
+}
+
+constexpr ParamDefault doubleDefault(const char *name, double value) {
+  return {name, ParamValueKind::Double, 0, {value, 0.0, 0.0}};
+}
+
+constexpr ParamDefault double2DDefault(const char *name, double x, double y) {
+  return {name, ParamValueKind::Double2D, 0, {x, y, 0.0}};
+}
+
+constexpr ParamDefault double3DDefault(const char *name, double x, double y, double z) {
+  return {name, ParamValueKind::Double3D, 0, {x, y, z}};
+}
+
+inline constexpr ParamDefault kParamDefaults[] = {
+  intDefault("process", 0),
+  intDefault("inputColorSpace", 0),
+  intDefault("outputRole", 0),
+  intDefault("sdrOutputColorSpace", 8),
+  intDefault("sceneOutputColorSpace", 3),
+  intDefault("hdrPreset", 0),
+  intDefault("hdrTransfer", 0),
+  doubleDefault("hdrReferenceWhiteNits", 203.0),
+  doubleDefault("hdrPeakNits", 1000.0),
+  doubleDefault("hdrExposureEv", 0.0),
+  intDefault("hdrToneMapping", 1),
+
+  boolDefault("cameraUvFilterEnabled", false),
+  doubleDefault("cameraUvCutNm", 410.0),
+  boolDefault("cameraIrFilterEnabled", false),
+  doubleDefault("cameraIrCutNm", 675.0),
+
+  intDefault("rgbToRawMethod", 0),
+  intDefault("film", static_cast<int>(spektrafilm::kSpektraDefaultFilmIndex)),
+  intDefault("filmPushPullMode", 0),
+  doubleDefault("filmPushPullStops", 0.0),
+  doubleDefault("negativeBleachBypassAmount", 0.0),
+  doubleDefault("negativeLeucoCyanCoupling", 1.0),
+  doubleDefault("filmExposureEv", 0.0),
+  boolDefault("autoExposure", false),
+  intDefault("autoExposureMethod", 0),
+  doubleDefault("filmGamma", 1.0),
+
+  intDefault("paper", static_cast<int>(spektrafilm::kSpektraDefaultPaperIndex)),
+  intDefault("printTiming", 0),
+  doubleDefault("printPushPullStops", 0.0),
+  doubleDefault("printBleachBypassAmount", 0.0),
+  doubleDefault("printExposureEv", 1.0),
+  doubleDefault("printGamma", 1.0),
+  doubleDefault("printShadowShape", 0.0),
+  doubleDefault("printHighlightShape", 0.0),
+  doubleDefault("filterC", 0.0),
+  doubleDefault("filterMShift", 0.0),
+  doubleDefault("filterYShift", 0.0),
+  doubleDefault("preflashExposure", 0.0),
+  doubleDefault("preflashMFilterShift", 0.0),
+  doubleDefault("preflashYFilterShift", 0.0),
+  boolDefault("printerLightsGang", false),
+  boolDefault("printerLightsGroup", false),
+  doubleDefault("printerLightR", 0.0),
+  doubleDefault("printerLightG", 0.0),
+  doubleDefault("printerLightB", 0.0),
+  boolDefault("printerLightCalibration", true),
+
+  doubleDefault("enlargerScale", 1.0),
+  doubleDefault("enlargerOffsetXPercent", 0.0),
+  doubleDefault("enlargerOffsetYPercent", 0.0),
+
+  doubleDefault("dirAmount", 0.0),
+  doubleDefault("dirDiffusionUm", 20.0),
+  doubleDefault("dirInhibitionSameLayer", 1.0),
+  doubleDefault("dirInhibitionInterlayer", 1.0),
+  double3DDefault("dirGammaSameLayerRgb", 0.336, 0.319, 0.273),
+  double2DDefault("dirGammaRToGb", 0.353, 0.302),
+  double2DDefault("dirGammaGToRb", 0.154, 0.353),
+  double2DDefault("dirGammaBToRg", 0.168, 0.226),
+  boolDefault("dirUsesStockCalibration", true),
+
+  boolDefault("grainEnabled", false),
+  intDefault("grainModel", 0),
+  intDefault("filmFormat", 4),
+  boolDefault("grainSublayersEnabled", true),
+  intDefault("grainSubLayerCount", 1),
+  doubleDefault("grainParticleAreaUm2", 0.1),
+  double3DDefault("grainParticleScale", 1.2, 1.0, 2.5),
+  double3DDefault("grainParticleScaleLayers", 6.0, 1.0, 0.4),
+  double3DDefault("grainDensityMin", 0.04, 0.05, 0.06),
+  double3DDefault("grainUniformity", 0.99, 0.97, 0.98),
+  doubleDefault("grainFinalBlurUm", 0.0),
+  doubleDefault("grainBlurDyeCloudsUm", 1.0),
+  double2DDefault("grainMicroStructure", 0.2, 30.0),
+  intDefault("grainSeed", 1),
+  boolDefault("grainAnimate", true),
+  doubleDefault("grainSynthesisSize", 1.0),
+  doubleDefault("grainSynthesisAmount", 1.0),
+  doubleDefault("grainSynthesisSharpness", 1.0),
+  doubleDefault("grainSynthesisQuality", 1.0),
+
+  intDefault("grainSynthesisSamples", 128),
+  doubleDefault("grainSynthesisMeanRadiusUm", 0.25),
+  doubleDefault("grainSynthesisRadiusStdDevRatio", 0.0),
+  doubleDefault("grainSynthesisObservationSigmaUm", 1.0),
+  doubleDefault("grainSynthesisCellSizeRatio", 1.0),
+  doubleDefault("grainSynthesisMaxRadiusQuantile", 0.999),
+  doubleDefault("grainSynthesisCoverageEpsilon", 0.0001),
+  intDefault("grainSynthesisMaxGrainsPerCell", 32),
+  double3DDefault("grainSynthesisRadiusScale", 1.2, 1.0, 2.5),
+  double3DDefault("grainSynthesisLayerScale", 6.0, 1.0, 0.4),
+  boolDefault("grainSynthesisLayered", true),
+
+  boolDefault("halationEnabled", false),
+  doubleDefault("scatterAmount", 1.0),
+  doubleDefault("scatterScale", 1.0),
+  doubleDefault("halationAmount", 1.0),
+  doubleDefault("halationScale", 1.0),
+  double3DDefault("halationStrength", 0.05, 0.015, 0.0),
+
+  boolDefault("cameraDiffusionEnabled", false),
+  intDefault("cameraDiffusionFamily", 1),
+  doubleDefault("cameraDiffusionStrength", 0.5),
+  doubleDefault("cameraDiffusionSpatialScale", 1.0),
+  doubleDefault("cameraDiffusionHaloWarmth", 0.0),
+  doubleDefault("cameraDiffusionCoreIntensity", 1.0),
+  doubleDefault("cameraDiffusionCoreSize", 1.0),
+  doubleDefault("cameraDiffusionHaloIntensity", 1.0),
+  doubleDefault("cameraDiffusionHaloSize", 1.0),
+  doubleDefault("cameraDiffusionBloomIntensity", 1.0),
+  doubleDefault("cameraDiffusionBloomSize", 1.0),
+  boolDefault("printDiffusionEnabled", false),
+  intDefault("printDiffusionFamily", 1),
+  doubleDefault("printDiffusionStrength", 0.5),
+  doubleDefault("printDiffusionSpatialScale", 1.0),
+  doubleDefault("printDiffusionHaloWarmth", 0.0),
+  doubleDefault("printDiffusionCoreIntensity", 1.0),
+  doubleDefault("printDiffusionCoreSize", 1.0),
+  doubleDefault("printDiffusionHaloIntensity", 1.0),
+  doubleDefault("printDiffusionHaloSize", 1.0),
+  doubleDefault("printDiffusionBloomIntensity", 1.0),
+  doubleDefault("printDiffusionBloomSize", 1.0),
+
+  boolDefault("scannerEnabled", false),
+  boolDefault("scannerWhiteCorrection", false),
+  boolDefault("scannerBlackCorrection", false),
+  doubleDefault("scannerWhiteLevel", 0.98),
+  doubleDefault("scannerBlackLevel", 0.01),
+  doubleDefault("glarePercent", 0.03),
+  doubleDefault("scannerMtf50LpMm", 60.0),
+  doubleDefault("scannerUnsharpRadiusUm", 5.0),
+  doubleDefault("scannerUnsharpAmount", 0.7),
+};
+
+struct StoredParamValue {
+  ParamValueKind kind = ParamValueKind::Int;
+  int intValue[3] = {0, 0, 0};
+  double doubleValue[3] = {0.0, 0.0, 0.0};
+};
+
+using DefaultsSnapshot = std::unordered_map<std::string, StoredParamValue>;
+
+const DefaultsSnapshot *gDescribeDefaults = nullptr;
+
+int paramComponentCount(ParamValueKind kind) {
+  switch (kind) {
+    case ParamValueKind::Double2D:
+      return 2;
+    case ParamValueKind::Double3D:
+      return 3;
+    case ParamValueKind::Int:
+    case ParamValueKind::Bool:
+    case ParamValueKind::Double:
+    default:
+      return 1;
+  }
+}
+
+bool paramKindUsesDouble(ParamValueKind kind) {
+  return kind == ParamValueKind::Double ||
+    kind == ParamValueKind::Double2D ||
+    kind == ParamValueKind::Double3D;
+}
+
+const ParamDefault *defaultForParam(const char *name) {
+  for (const ParamDefault &entry : kParamDefaults) {
+    if (std::strcmp(entry.name, name) == 0) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+StoredParamValue factoryStoredValue(const ParamDefault &entry) {
+  StoredParamValue value{};
+  value.kind = entry.kind;
+  if (paramKindUsesDouble(entry.kind)) {
+    for (int i = 0; i < paramComponentCount(entry.kind); ++i) {
+      value.doubleValue[i] = entry.doubleDefault[i];
+    }
+  } else {
+    value.intValue[0] = entry.intDefault;
+  }
+  return value;
+}
+
+bool storedValueForDefault(const char *name, StoredParamValue &value) {
+  if (!gDescribeDefaults) {
+    return false;
+  }
+  const ParamDefault *entry = defaultForParam(name);
+  if (!entry) {
+    return false;
+  }
+  const auto found = gDescribeDefaults->find(name);
+  if (found == gDescribeDefaults->end() || found->second.kind != entry->kind) {
+    return false;
+  }
+  value = found->second;
+  return true;
+}
+
+struct InstanceData {
+  OfxImageClipHandle sourceClip = nullptr;
+  OfxImageClipHandle outputClip = nullptr;
+
+  OfxParamHandle process = nullptr;
+  OfxParamHandle rgbToRawMethod = nullptr;
+  OfxParamHandle inputColorSpace = nullptr;
+  OfxParamHandle outputRole = nullptr;
+  OfxParamHandle sdrOutputColorSpace = nullptr;
+  OfxParamHandle sceneOutputColorSpace = nullptr;
+  OfxParamHandle hdrPreset = nullptr;
+  OfxParamHandle hdrTransfer = nullptr;
+  OfxParamHandle hdrReferenceWhiteNits = nullptr;
+  OfxParamHandle hdrPeakNits = nullptr;
+  OfxParamHandle hdrExposureEv = nullptr;
+  OfxParamHandle hdrToneMapping = nullptr;
+  OfxParamHandle cameraUvFilterEnabled = nullptr;
+  OfxParamHandle cameraUvCutNm = nullptr;
+  OfxParamHandle cameraIrFilterEnabled = nullptr;
+  OfxParamHandle cameraIrCutNm = nullptr;
+  OfxParamHandle film = nullptr;
+  OfxParamHandle paper = nullptr;
+  OfxParamHandle printTiming = nullptr;
+  OfxParamHandle filmExposureEv = nullptr;
+  OfxParamHandle autoExposure = nullptr;
+  OfxParamHandle autoExposureMethod = nullptr;
+  OfxParamHandle printExposureEv = nullptr;
+  OfxParamHandle filmPushPullMode = nullptr;
+  OfxParamHandle filmPushPullStops = nullptr;
+  OfxParamHandle printPushPullStops = nullptr;
+  OfxParamHandle negativeBleachBypassAmount = nullptr;
+  OfxParamHandle negativeLeucoCyanCoupling = nullptr;
+  OfxParamHandle printBleachBypassAmount = nullptr;
+  OfxParamHandle filmGamma = nullptr;
+  OfxParamHandle printGamma = nullptr;
+  OfxParamHandle printShadowShape = nullptr;
+  OfxParamHandle printHighlightShape = nullptr;
+  OfxParamHandle filterC = nullptr;
+  OfxParamHandle filterMShift = nullptr;
+  OfxParamHandle filterYShift = nullptr;
+  OfxParamHandle enlargerScale = nullptr;
+  OfxParamHandle enlargerOffsetXPercent = nullptr;
+  OfxParamHandle enlargerOffsetYPercent = nullptr;
+  OfxParamHandle preflashExposure = nullptr;
+  OfxParamHandle preflashMFilterShift = nullptr;
+  OfxParamHandle preflashYFilterShift = nullptr;
+  OfxParamHandle printerLightR = nullptr;
+  OfxParamHandle printerLightG = nullptr;
+  OfxParamHandle printerLightB = nullptr;
+  OfxParamHandle printerLightsGang = nullptr;
+  OfxParamHandle printerLightsGroup = nullptr;
+  OfxParamHandle printerLightCalibration = nullptr;
+  OfxParamHandle dirAmount = nullptr;
+  OfxParamHandle dirDiffusionUm = nullptr;
+  OfxParamHandle dirInhibitionSameLayer = nullptr;
+  OfxParamHandle dirInhibitionInterlayer = nullptr;
+  OfxParamHandle dirGammaSameLayerRgb = nullptr;
+  OfxParamHandle dirGammaRToGb = nullptr;
+  OfxParamHandle dirGammaGToRb = nullptr;
+  OfxParamHandle dirGammaBToRg = nullptr;
+  OfxParamHandle dirCalibrateToStock = nullptr;
+  OfxParamHandle dirUsesStockCalibration = nullptr;
+  OfxParamHandle grainEnabled = nullptr;
+  OfxParamHandle grainModel = nullptr;
+  OfxParamHandle filmFormat = nullptr;
+  OfxParamHandle grainSublayersEnabled = nullptr;
+  OfxParamHandle grainSubLayerCount = nullptr;
+  OfxParamHandle grainParticleAreaUm2 = nullptr;
+  OfxParamHandle grainParticleScale = nullptr;
+  OfxParamHandle grainParticleScaleLayers = nullptr;
+  OfxParamHandle grainDensityMin = nullptr;
+  OfxParamHandle grainUniformity = nullptr;
+  OfxParamHandle grainFinalBlurUm = nullptr;
+  OfxParamHandle grainBlurDyeCloudsUm = nullptr;
+  OfxParamHandle grainMicroStructure = nullptr;
+  OfxParamHandle grainSeed = nullptr;
+  OfxParamHandle grainAnimate = nullptr;
+  OfxParamHandle grainSynthesisSize = nullptr;
+  OfxParamHandle grainSynthesisAmount = nullptr;
+  OfxParamHandle grainSynthesisSharpness = nullptr;
+  OfxParamHandle grainSynthesisQuality = nullptr;
+  OfxParamHandle grainSynthesisSamples = nullptr;
+  OfxParamHandle grainSynthesisMeanRadiusUm = nullptr;
+  OfxParamHandle grainSynthesisRadiusStdDevRatio = nullptr;
+  OfxParamHandle grainSynthesisObservationSigmaUm = nullptr;
+  OfxParamHandle grainSynthesisCellSizeRatio = nullptr;
+  OfxParamHandle grainSynthesisMaxRadiusQuantile = nullptr;
+  OfxParamHandle grainSynthesisCoverageEpsilon = nullptr;
+  OfxParamHandle grainSynthesisMaxGrainsPerCell = nullptr;
+  OfxParamHandle grainSynthesisRadiusScale = nullptr;
+  OfxParamHandle grainSynthesisLayerScale = nullptr;
+  OfxParamHandle grainSynthesisLayered = nullptr;
+  OfxParamHandle halationEnabled = nullptr;
+  OfxParamHandle scatterAmount = nullptr;
+  OfxParamHandle scatterScale = nullptr;
+  OfxParamHandle halationAmount = nullptr;
+  OfxParamHandle halationScale = nullptr;
+  OfxParamHandle halationStrength = nullptr;
+  OfxParamHandle cameraDiffusionEnabled = nullptr;
+  OfxParamHandle cameraDiffusionFamily = nullptr;
+  OfxParamHandle cameraDiffusionStrength = nullptr;
+  OfxParamHandle cameraDiffusionSpatialScale = nullptr;
+  OfxParamHandle cameraDiffusionHaloWarmth = nullptr;
+  OfxParamHandle cameraDiffusionCoreIntensity = nullptr;
+  OfxParamHandle cameraDiffusionCoreSize = nullptr;
+  OfxParamHandle cameraDiffusionHaloIntensity = nullptr;
+  OfxParamHandle cameraDiffusionHaloSize = nullptr;
+  OfxParamHandle cameraDiffusionBloomIntensity = nullptr;
+  OfxParamHandle cameraDiffusionBloomSize = nullptr;
+  OfxParamHandle printDiffusionEnabled = nullptr;
+  OfxParamHandle printDiffusionFamily = nullptr;
+  OfxParamHandle printDiffusionStrength = nullptr;
+  OfxParamHandle printDiffusionSpatialScale = nullptr;
+  OfxParamHandle printDiffusionHaloWarmth = nullptr;
+  OfxParamHandle printDiffusionCoreIntensity = nullptr;
+  OfxParamHandle printDiffusionCoreSize = nullptr;
+  OfxParamHandle printDiffusionHaloIntensity = nullptr;
+  OfxParamHandle printDiffusionHaloSize = nullptr;
+  OfxParamHandle printDiffusionBloomIntensity = nullptr;
+  OfxParamHandle printDiffusionBloomSize = nullptr;
+  OfxParamHandle scannerEnabled = nullptr;
+  OfxParamHandle scannerWhiteCorrection = nullptr;
+  OfxParamHandle scannerBlackCorrection = nullptr;
+  OfxParamHandle scannerWhiteLevel = nullptr;
+  OfxParamHandle scannerBlackLevel = nullptr;
+  OfxParamHandle glarePercent = nullptr;
+  OfxParamHandle scannerMtf50LpMm = nullptr;
+  OfxParamHandle scannerUnsharpRadiusUm = nullptr;
+  OfxParamHandle scannerUnsharpAmount = nullptr;
+  OfxParamHandle lutSize = nullptr;
+  OfxParamHandle lutDestination = nullptr;
+  OfxParamHandle lutIdentifier = nullptr;
+  OfxParamHandle exportLut = nullptr;
+
+  double lastPrinterLights[3] = {0.0, 0.0, 0.0};
+  bool lastPrinterLightsInitialized = false;
+  bool syncingPrinterLights = false;
+  bool syncingDirCalibration = false;
+
+  std::unique_ptr<spektrafilm::MetalRenderer> renderer;
+};
+
+InstanceData *getInstanceData(OfxImageEffectHandle effect) {
+  OfxPropertySetHandle props = nullptr;
+  gEffectHost->getPropertySet(effect, &props);
+  InstanceData *data = nullptr;
+  gPropHost->propGetPointer(props, kOfxPropInstanceData, 0, reinterpret_cast<void **>(&data));
+  return data;
+}
+
+int mapPixelDepth(const char *depth) {
+  if (!depth) {
+    return 0;
+  }
+  if (std::strcmp(depth, kOfxBitDepthHalf) == 0) {
+    return 16;
+  }
+  if (std::strcmp(depth, kOfxBitDepthFloat) == 0) {
+    return 32;
+  }
+  return 0;
+}
+
+int componentsForString(const char *components) {
+  if (!components) {
+    return 0;
+  }
+  if (std::strcmp(components, kOfxImageComponentRGBA) == 0) {
+    return 4;
+  }
+  if (std::strcmp(components, kOfxImageComponentRGB) == 0) {
+    return 3;
+  }
+  if (std::strcmp(components, kOfxImageComponentAlpha) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+OfxStatus fetchImageView(
+  OfxImageClipHandle clip,
+  OfxTime time,
+  OfxPropertySetHandle *image,
+  spektrafilm::ImageView &view
+) {
+  if (gEffectHost->clipGetImage(clip, time, nullptr, image) != kOfxStatOK || !*image) {
+    return kOfxStatFailed;
+  }
+
+  OfxRectI bounds{};
+  char *depth = nullptr;
+  char *components = nullptr;
+  void *data = nullptr;
+  int rowBytes = 0;
+  gPropHost->propGetIntN(*image, kOfxImagePropBounds, 4, &bounds.x1);
+  gPropHost->propGetString(*image, kOfxImageEffectPropPixelDepth, 0, &depth);
+  gPropHost->propGetString(*image, kOfxImageEffectPropComponents, 0, &components);
+  gPropHost->propGetInt(*image, kOfxImagePropRowBytes, 0, &rowBytes);
+  gPropHost->propGetPointer(*image, kOfxImagePropData, 0, &data);
+
+  const int bitDepth = mapPixelDepth(depth);
+  view.data = data;
+  view.x1 = bounds.x1;
+  view.y1 = bounds.y1;
+  view.width = bounds.x2 - bounds.x1;
+  view.height = bounds.y2 - bounds.y1;
+  view.rowBytes = rowBytes;
+  view.components = componentsForString(components);
+  view.bytesPerComponent = bitDepth / 8;
+  return data && view.components == 4 && view.bytesPerComponent > 0 ? kOfxStatOK : kOfxStatErrFormat;
+}
+
+OfxStatus fetchMutableImageView(
+  OfxImageClipHandle clip,
+  OfxTime time,
+  OfxPropertySetHandle *image,
+  spektrafilm::MutableImageView &view
+) {
+  spektrafilm::ImageView immutable{};
+  OfxStatus status = fetchImageView(clip, time, image, immutable);
+  if (status != kOfxStatOK) {
+    return status;
+  }
+  view.data = const_cast<void *>(immutable.data);
+  view.x1 = immutable.x1;
+  view.y1 = immutable.y1;
+  view.width = immutable.width;
+  view.height = immutable.height;
+  view.rowBytes = immutable.rowBytes;
+  view.components = immutable.components;
+  view.bytesPerComponent = immutable.bytesPerComponent;
+  return kOfxStatOK;
+}
+
+void releaseImage(OfxPropertySetHandle image) {
+  if (image) {
+    gEffectHost->clipReleaseImage(image);
+  }
+}
+
+double getDoubleAtTime(OfxParamHandle handle, OfxTime time, double fallback = 0.0) {
+  if (!handle) {
+    return fallback;
+  }
+  double value = fallback;
+  gParamHost->paramGetValueAtTime(handle, time, &value);
+  return value;
+}
+
+int getIntAtTime(OfxParamHandle handle, OfxTime time, int fallback = 0) {
+  if (!handle) {
+    return fallback;
+  }
+  int value = fallback;
+  gParamHost->paramGetValueAtTime(handle, time, &value);
+  return value;
+}
+
+bool getBoolAtTime(OfxParamHandle handle, OfxTime time, bool fallback = false) {
+  return getIntAtTime(handle, time, fallback ? 1 : 0) != 0;
+}
+
+bool getBoolValue(OfxParamHandle handle, bool fallback = false) {
+  if (!handle) {
+    return fallback;
+  }
+  int value = fallback ? 1 : 0;
+  gParamHost->paramGetValue(handle, &value);
+  return value != 0;
+}
+
+int getIntValue(OfxParamHandle handle, int fallback = 0) {
+  if (!handle) {
+    return fallback;
+  }
+  int value = fallback;
+  gParamHost->paramGetValue(handle, &value);
+  return value;
+}
+
+void setParamSecret(OfxParamHandle handle, bool secret) {
+  if (!handle || !gParamHost || !gPropHost) {
+    return;
+  }
+  OfxPropertySetHandle props = nullptr;
+  if (gParamHost->paramGetPropertySet(handle, &props) != kOfxStatOK || !props) {
+    return;
+  }
+  gPropHost->propSetInt(props, kOfxParamPropSecret, 0, secret ? 1 : 0);
+  gPropHost->propSetInt(props, kOfxParamPropEnabled, 0, secret ? 0 : 1);
+}
+
+void setParamEnabled(OfxParamHandle handle, bool enabled) {
+  if (!handle || !gParamHost || !gPropHost) {
+    return;
+  }
+  OfxPropertySetHandle props = nullptr;
+  if (gParamHost->paramGetPropertySet(handle, &props) != kOfxStatOK || !props) {
+    return;
+  }
+  gPropHost->propSetInt(props, kOfxParamPropEnabled, 0, enabled ? 1 : 0);
+}
+
+void setParamSecretForFlavor(OfxParamHandle handle, const char *name, bool secret) {
+  setParamSecret(handle, secret || parameterHiddenInFlavor(name));
+}
+
+void syncConditionalParamVisibility(InstanceData *data) {
+  if (!data) {
+    return;
+  }
+
+  const spektrafilm::OutputRole outputRole = outputRoleForFlavor(
+    getIntValue(data->outputRole, static_cast<int>(spektrafilm::OutputRole::DisplaySdr))
+  );
+  const bool sdrOutput = outputRole == spektrafilm::OutputRole::DisplaySdr;
+  const bool hdrOutput = outputRole == spektrafilm::OutputRole::DisplayHdr;
+  const bool sceneHandoff = outputRole == spektrafilm::OutputRole::SceneHandoff;
+  setParamSecretForFlavor(data->sdrOutputColorSpace, "sdrOutputColorSpace", !sdrOutput);
+  setParamSecretForFlavor(data->sceneOutputColorSpace, "sceneOutputColorSpace", !sceneHandoff);
+  setParamSecretForFlavor(data->hdrPreset, "hdrPreset", !hdrOutput);
+  setParamSecretForFlavor(data->hdrTransfer, "hdrTransfer", !hdrOutput);
+  setParamSecretForFlavor(data->hdrReferenceWhiteNits, "hdrReferenceWhiteNits", !hdrOutput);
+  setParamSecretForFlavor(data->hdrPeakNits, "hdrPeakNits", !hdrOutput);
+  setParamSecretForFlavor(data->hdrExposureEv, "hdrExposureEv", !hdrOutput);
+  setParamSecretForFlavor(data->hdrToneMapping, "hdrToneMapping", !hdrOutput);
+
+  const bool synthesisModel = getIntValue(data->grainModel, static_cast<int>(spektrafilm::GrainModel::Preview)) ==
+    static_cast<int>(spektrafilm::GrainModel::GrainSynthesis);
+  setParamSecretForFlavor(data->grainSynthesisSize, "grainSynthesisSize", !synthesisModel);
+  setParamSecretForFlavor(data->grainSynthesisAmount, "grainSynthesisAmount", !synthesisModel);
+  setParamSecretForFlavor(data->grainSynthesisSharpness, "grainSynthesisSharpness", !synthesisModel);
+  setParamSecretForFlavor(data->grainSynthesisQuality, "grainSynthesisQuality", !synthesisModel);
+
+  const bool sublayersEnabled = getBoolValue(data->grainSublayersEnabled, true);
+  setParamSecretForFlavor(data->grainSubLayerCount, "grainSubLayerCount", sublayersEnabled);
+
+  const bool apdPrintTiming = spektrafilm::kSpektraAcademyPrinterDensityEnabled &&
+    getIntValue(data->printTiming, static_cast<int>(spektrafilm::PrintTimingMode::FilteredEnlarger)) ==
+    static_cast<int>(spektrafilm::PrintTimingMode::ApdPrinterDensity);
+  setParamSecretForFlavor(data->filterC, "filterC", apdPrintTiming);
+  setParamSecretForFlavor(data->filterMShift, "filterMShift", apdPrintTiming);
+  setParamSecretForFlavor(data->filterYShift, "filterYShift", apdPrintTiming);
+  setParamSecretForFlavor(data->preflashMFilterShift, "preflashMFilterShift", apdPrintTiming);
+  setParamSecretForFlavor(data->preflashYFilterShift, "preflashYFilterShift", apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightsGang, "printerLightsGang", !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightsGroup, "printerLightsGroup", !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightR, "printerLightR", !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightG, "printerLightG", !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightB, "printerLightB", !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightCalibration, "printerLightCalibration", !apdPrintTiming);
+
+  const bool lutExportAllowed = outputRole == spektrafilm::OutputRole::DisplaySdr;
+  setParamEnabled(data->exportLut, lutExportAllowed);
+}
+
+bool readCurrentPrinterLights(InstanceData *data, double (&current)[3]) {
+  if (!data || !data->printerLightR || !data->printerLightG || !data->printerLightB) {
+    return false;
+  }
+  gParamHost->paramGetValue(data->printerLightR, &current[0]);
+  gParamHost->paramGetValue(data->printerLightG, &current[1]);
+  gParamHost->paramGetValue(data->printerLightB, &current[2]);
+  return true;
+}
+
+void rememberCurrentPrinterLights(InstanceData *data, const double (&current)[3]) {
+  if (!data) {
+    return;
+  }
+  data->lastPrinterLights[0] = current[0];
+  data->lastPrinterLights[1] = current[1];
+  data->lastPrinterLights[2] = current[2];
+  data->lastPrinterLightsInitialized = true;
+}
+
+void rememberCurrentPrinterLights(InstanceData *data) {
+  double current[3] = {0.0, 0.0, 0.0};
+  if (readCurrentPrinterLights(data, current)) {
+    rememberCurrentPrinterLights(data, current);
+  }
+}
+
+const spektrafilm::ProfileCurveSet *currentFilmCurves(InstanceData *data) {
+  int filmIndex = static_cast<int>(spektrafilm::kSpektraDefaultFilmIndex);
+  if (data && data->film) {
+    gParamHost->paramGetValue(data->film, &filmIndex);
+  }
+  const spektrafilm::ProfileCurveSet *curves = spektrafilm::filmProfileCurves(filmIndex);
+  return curves ? curves : spektrafilm::filmProfileCurves(static_cast<int32_t>(spektrafilm::kSpektraDefaultFilmIndex));
+}
+
+bool dirUsesStockCalibration(InstanceData *data) {
+  return data && data->dirUsesStockCalibration &&
+    getBoolValue(data->dirUsesStockCalibration, true);
+}
+
+bool applyDirStockCalibration(InstanceData *data, bool resetMultipliers) {
+  if (!data || !data->dirGammaSameLayerRgb || !data->dirGammaRToGb || !data->dirGammaGToRb ||
+      !data->dirGammaBToRg || !data->dirUsesStockCalibration) {
+    return false;
+  }
+  const spektrafilm::ProfileCurveSet *curves = currentFilmCurves(data);
+  if (!curves || !curves->dirGammaSameLayerRgb || !curves->dirGammaRToGb ||
+      !curves->dirGammaGToRb || !curves->dirGammaBToRg) {
+    return false;
+  }
+
+  data->syncingDirCalibration = true;
+  if (resetMultipliers) {
+    if (data->dirInhibitionSameLayer) {
+      gParamHost->paramSetValue(data->dirInhibitionSameLayer, 1.0);
+    }
+    if (data->dirInhibitionInterlayer) {
+      gParamHost->paramSetValue(data->dirInhibitionInterlayer, 1.0);
+    }
+  }
+  gParamHost->paramSetValue(
+    data->dirGammaSameLayerRgb,
+    curves->dirGammaSameLayerRgb[0],
+    curves->dirGammaSameLayerRgb[1],
+    curves->dirGammaSameLayerRgb[2]
+  );
+  gParamHost->paramSetValue(data->dirGammaRToGb, curves->dirGammaRToGb[0], curves->dirGammaRToGb[1]);
+  gParamHost->paramSetValue(data->dirGammaGToRb, curves->dirGammaGToRb[0], curves->dirGammaGToRb[1]);
+  gParamHost->paramSetValue(data->dirGammaBToRg, curves->dirGammaBToRg[0], curves->dirGammaBToRg[1]);
+  gParamHost->paramSetValue(data->dirUsesStockCalibration, 1);
+  data->syncingDirCalibration = false;
+  return true;
+}
+
+struct HdrPresetValues {
+  int transfer = 0;
+  double referenceWhiteNits = 203.0;
+  double peakNits = 1000.0;
+  int toneMapping = 1;
+};
+
+HdrPresetValues hdrPresetValues(int preset) {
+  switch (preset) {
+    case 1:
+      return {0, 203.0, 4000.0, 1};
+    case 2:
+      return {1, 203.0, 1000.0, 1};
+    default:
+      return {0, 203.0, 1000.0, 1};
+  }
+}
+
+spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
+  constexpr spektrafilm::ColorSpace kSdrOutputColorSpaces[] = {
+    spektrafilm::ColorSpace::Srgb,
+    spektrafilm::ColorSpace::DisplayP3,
+    spektrafilm::ColorSpace::ProPhotoRgb,
+    spektrafilm::ColorSpace::AdobeRgb1998,
+    spektrafilm::ColorSpace::DciP3,
+    spektrafilm::ColorSpace::P3D65Gamma22,
+    spektrafilm::ColorSpace::P3D65Gamma26,
+    spektrafilm::ColorSpace::Rec709Gamma22,
+    spektrafilm::ColorSpace::Rec709Gamma24,
+  };
+  constexpr spektrafilm::ColorSpace kSceneOutputColorSpaces[] = {
+    spektrafilm::ColorSpace::ArriLogC4,
+    spektrafilm::ColorSpace::ArriLogC3Ei800,
+    spektrafilm::ColorSpace::BmdFilmWideGamutGen5,
+    spektrafilm::ColorSpace::DavinciIntermediateWideGamut,
+    spektrafilm::ColorSpace::RedLog3G10RedWideGamutRgb,
+    spektrafilm::ColorSpace::SonySLog3SGamut3,
+    spektrafilm::ColorSpace::SonySLog3SGamut3Cine,
+    spektrafilm::ColorSpace::CanonLog2CinemaGamutD55,
+    spektrafilm::ColorSpace::CanonLog3CinemaGamutD55,
+    spektrafilm::ColorSpace::PanasonicVLogVGamut,
+    spektrafilm::ColorSpace::Aces2065_1,
+    spektrafilm::ColorSpace::AcesCg,
+    spektrafilm::ColorSpace::LinearRec2020,
+    spektrafilm::ColorSpace::LinearRec709,
+    spektrafilm::ColorSpace::LinearP3D65,
+  };
+
+  spektrafilm::RenderParams params{};
+  params.process = getIntAtTime(data->process, time, 0) == 1
+    ? spektrafilm::ProcessMode::ScanNegative
+    : spektrafilm::ProcessMode::PrintSimulation;
+  params.rgbToRawMethod = static_cast<spektrafilm::RgbToRawMethod>(getIntAtTime(data->rgbToRawMethod, time, 0));
+  params.inputColorSpace = static_cast<spektrafilm::ColorSpace>(getIntAtTime(data->inputColorSpace, time, 0));
+  params.outputRole = outputRoleForFlavor(getIntAtTime(data->outputRole, time, 0));
+  if (params.outputRole == spektrafilm::OutputRole::SceneHandoff) {
+    const int sceneIndex = std::clamp(
+      getIntAtTime(data->sceneOutputColorSpace, time, 3),
+      0,
+      static_cast<int>(std::size(kSceneOutputColorSpaces) - 1u)
+    );
+    params.outputColorSpace = kSceneOutputColorSpaces[sceneIndex];
+  } else {
+    const int sdrIndex = std::clamp(
+      getIntAtTime(data->sdrOutputColorSpace, time, 8),
+      0,
+      static_cast<int>(std::size(kSdrOutputColorSpaces) - 1u)
+    );
+    params.outputColorSpace = kSdrOutputColorSpaces[sdrIndex];
+  }
+  params.hdrPreset = static_cast<spektrafilm::HdrPreset>(getIntAtTime(data->hdrPreset, time, 0));
+  params.hdrTransfer = static_cast<spektrafilm::HdrTransfer>(getIntAtTime(data->hdrTransfer, time, 0));
+  params.hdrReferenceWhiteNits = static_cast<float>(getDoubleAtTime(data->hdrReferenceWhiteNits, time, 203.0));
+  params.hdrPeakNits = static_cast<float>(getDoubleAtTime(data->hdrPeakNits, time, 1000.0));
+  params.hdrExposureEv = static_cast<float>(getDoubleAtTime(data->hdrExposureEv, time, 0.0));
+  params.hdrToneMapping = static_cast<spektrafilm::HdrToneMapping>(getIntAtTime(data->hdrToneMapping, time, 1));
+  params.cameraUvFilterEnabled = getBoolAtTime(data->cameraUvFilterEnabled, time, false);
+  params.cameraUvCutNm = static_cast<float>(getDoubleAtTime(data->cameraUvCutNm, time, 410.0));
+  params.cameraIrFilterEnabled = getBoolAtTime(data->cameraIrFilterEnabled, time, false);
+  params.cameraIrCutNm = static_cast<float>(getDoubleAtTime(data->cameraIrCutNm, time, 675.0));
+  params.film = getIntAtTime(data->film, time, static_cast<int>(spektrafilm::kSpektraDefaultFilmIndex));
+  params.paper = getIntAtTime(data->paper, time, static_cast<int>(spektrafilm::kSpektraDefaultPaperIndex));
+  const int printTiming = spektrafilm::kSpektraAcademyPrinterDensityEnabled
+    ? getIntAtTime(data->printTiming, time, 0)
+    : static_cast<int>(spektrafilm::PrintTimingMode::FilteredEnlarger);
+  params.printTiming = static_cast<spektrafilm::PrintTimingMode>(printTiming);
+  params.filmExposureEv = static_cast<float>(getDoubleAtTime(data->filmExposureEv, time, 0.0));
+  params.autoExposure = getBoolAtTime(data->autoExposure, time, false);
+  params.autoExposureMethod = static_cast<spektrafilm::AutoExposureMethod>(getIntAtTime(data->autoExposureMethod, time, 0));
+  params.printExposureEv = static_cast<float>(getDoubleAtTime(data->printExposureEv, time, 1.0));
+  params.filmPushPullMode = static_cast<spektrafilm::PushPullMode>(getIntAtTime(data->filmPushPullMode, time, 0));
+  params.filmPushPullStops = static_cast<float>(getDoubleAtTime(data->filmPushPullStops, time, 0.0));
+  params.printPushPullStops = static_cast<float>(getDoubleAtTime(data->printPushPullStops, time, 0.0));
+  params.negativeBleachBypassAmount = static_cast<float>(getDoubleAtTime(data->negativeBleachBypassAmount, time, 0.0));
+  params.negativeLeucoCyanCoupling = static_cast<float>(getDoubleAtTime(data->negativeLeucoCyanCoupling, time, 1.0));
+  params.printBleachBypassAmount = static_cast<float>(getDoubleAtTime(data->printBleachBypassAmount, time, 0.0));
+  params.filmGamma = static_cast<float>(getDoubleAtTime(data->filmGamma, time, 1.0));
+  params.printGamma = static_cast<float>(getDoubleAtTime(data->printGamma, time, 1.0));
+  params.printShadowShape = static_cast<float>(getDoubleAtTime(data->printShadowShape, time, 0.0));
+  params.printHighlightShape = static_cast<float>(getDoubleAtTime(data->printHighlightShape, time, 0.0));
+  params.filterC = static_cast<float>(getDoubleAtTime(data->filterC, time, 0.0));
+  params.filterMShift = static_cast<float>(getDoubleAtTime(data->filterMShift, time, 0.0));
+  params.filterYShift = static_cast<float>(getDoubleAtTime(data->filterYShift, time, 0.0));
+  params.enlargerScale = static_cast<float>(getDoubleAtTime(data->enlargerScale, time, 1.0));
+  params.enlargerOffsetXPercent = static_cast<float>(getDoubleAtTime(data->enlargerOffsetXPercent, time, 0.0));
+  params.enlargerOffsetYPercent = static_cast<float>(getDoubleAtTime(data->enlargerOffsetYPercent, time, 0.0));
+  params.preflashExposure = static_cast<float>(getDoubleAtTime(data->preflashExposure, time, 0.0));
+  params.preflashMFilterShift = static_cast<float>(getDoubleAtTime(data->preflashMFilterShift, time, 0.0));
+  params.preflashYFilterShift = static_cast<float>(getDoubleAtTime(data->preflashYFilterShift, time, 0.0));
+  params.printerLightsR = static_cast<float>(getDoubleAtTime(data->printerLightR, time, 0.0));
+  params.printerLightsG = static_cast<float>(getDoubleAtTime(data->printerLightG, time, 0.0));
+  params.printerLightsB = static_cast<float>(getDoubleAtTime(data->printerLightB, time, 0.0));
+  params.printerLightsGang = getBoolAtTime(data->printerLightsGang, time, false);
+  params.printerLightCalibration = getBoolAtTime(data->printerLightCalibration, time, true);
+  params.dirCouplersAmount = static_cast<float>(getDoubleAtTime(data->dirAmount, time, 0.0));
+  params.dirCouplersDiffusionUm = static_cast<float>(getDoubleAtTime(data->dirDiffusionUm, time, 20.0));
+  params.dirCouplersInhibitionSameLayer = static_cast<float>(getDoubleAtTime(data->dirInhibitionSameLayer, time, 1.0));
+  params.dirCouplersInhibitionInterlayer = static_cast<float>(getDoubleAtTime(data->dirInhibitionInterlayer, time, 1.0));
+  double dirGammaSameLayerRgb[3] = {0.336, 0.319, 0.273};
+  if (data->dirGammaSameLayerRgb) {
+    gParamHost->paramGetValueAtTime(
+      data->dirGammaSameLayerRgb,
+      time,
+      &dirGammaSameLayerRgb[0],
+      &dirGammaSameLayerRgb[1],
+      &dirGammaSameLayerRgb[2]
+    );
+  }
+  double dirGammaRToGb[2] = {0.353, 0.302};
+  if (data->dirGammaRToGb) {
+    gParamHost->paramGetValueAtTime(data->dirGammaRToGb, time, &dirGammaRToGb[0], &dirGammaRToGb[1]);
+  }
+  double dirGammaGToRb[2] = {0.154, 0.353};
+  if (data->dirGammaGToRb) {
+    gParamHost->paramGetValueAtTime(data->dirGammaGToRb, time, &dirGammaGToRb[0], &dirGammaGToRb[1]);
+  }
+  double dirGammaBToRg[2] = {0.168, 0.226};
+  if (data->dirGammaBToRg) {
+    gParamHost->paramGetValueAtTime(data->dirGammaBToRg, time, &dirGammaBToRg[0], &dirGammaBToRg[1]);
+  }
+  params.dirCouplersGammaSameLayerR = static_cast<float>(dirGammaSameLayerRgb[0]);
+  params.dirCouplersGammaSameLayerG = static_cast<float>(dirGammaSameLayerRgb[1]);
+  params.dirCouplersGammaSameLayerB = static_cast<float>(dirGammaSameLayerRgb[2]);
+  params.dirCouplersGammaRToG = static_cast<float>(dirGammaRToGb[0]);
+  params.dirCouplersGammaRToB = static_cast<float>(dirGammaRToGb[1]);
+  params.dirCouplersGammaGToR = static_cast<float>(dirGammaGToRb[0]);
+  params.dirCouplersGammaGToB = static_cast<float>(dirGammaGToRb[1]);
+  params.dirCouplersGammaBToR = static_cast<float>(dirGammaBToRg[0]);
+  params.dirCouplersGammaBToG = static_cast<float>(dirGammaBToRg[1]);
+  params.grainEnabled = getBoolAtTime(data->grainEnabled, time, true);
+  params.grainModel = static_cast<spektrafilm::GrainModel>(getIntAtTime(data->grainModel, time, 0));
+  if (!flavorAllowsDevelopmentControls() && params.grainModel == spektrafilm::GrainModel::GrainSynthesis) {
+    params.grainModel = spektrafilm::GrainModel::Preview;
+  }
+  params.filmFormat = static_cast<spektrafilm::FilmFormat>(getIntAtTime(data->filmFormat, time, 4));
+  params.grainSublayersEnabled = getBoolAtTime(data->grainSublayersEnabled, time, true);
+  params.grainSubLayerCount = getIntAtTime(data->grainSubLayerCount, time, 1);
+  params.grainParticleAreaUm2 = static_cast<float>(getDoubleAtTime(data->grainParticleAreaUm2, time, 0.1));
+  double grainParticleScale[3] = {1.2, 1.0, 2.5};
+  if (data->grainParticleScale) {
+    gParamHost->paramGetValueAtTime(data->grainParticleScale, time, &grainParticleScale[0], &grainParticleScale[1], &grainParticleScale[2]);
+  }
+  params.grainParticleScaleR = static_cast<float>(grainParticleScale[0]);
+  params.grainParticleScaleG = static_cast<float>(grainParticleScale[1]);
+  params.grainParticleScaleB = static_cast<float>(grainParticleScale[2]);
+  double grainParticleScaleLayers[3] = {6.0, 1.0, 0.4};
+  if (data->grainParticleScaleLayers) {
+    gParamHost->paramGetValueAtTime(data->grainParticleScaleLayers, time, &grainParticleScaleLayers[0], &grainParticleScaleLayers[1], &grainParticleScaleLayers[2]);
+  }
+  params.grainParticleScaleLayer0 = static_cast<float>(grainParticleScaleLayers[0]);
+  params.grainParticleScaleLayer1 = static_cast<float>(grainParticleScaleLayers[1]);
+  params.grainParticleScaleLayer2 = static_cast<float>(grainParticleScaleLayers[2]);
+  double grainDensityMin[3] = {0.04, 0.05, 0.06};
+  if (data->grainDensityMin) {
+    gParamHost->paramGetValueAtTime(data->grainDensityMin, time, &grainDensityMin[0], &grainDensityMin[1], &grainDensityMin[2]);
+  }
+  params.grainDensityMinR = static_cast<float>(grainDensityMin[0]);
+  params.grainDensityMinG = static_cast<float>(grainDensityMin[1]);
+  params.grainDensityMinB = static_cast<float>(grainDensityMin[2]);
+  double grainUniformity[3] = {0.99, 0.97, 0.98};
+  if (data->grainUniformity) {
+    gParamHost->paramGetValueAtTime(data->grainUniformity, time, &grainUniformity[0], &grainUniformity[1], &grainUniformity[2]);
+  }
+  params.grainUniformityR = static_cast<float>(grainUniformity[0]);
+  params.grainUniformityG = static_cast<float>(grainUniformity[1]);
+  params.grainUniformityB = static_cast<float>(grainUniformity[2]);
+  params.grainFinalBlurUm = static_cast<float>(getDoubleAtTime(data->grainFinalBlurUm, time, 0.0));
+  params.grainBlurDyeCloudsUm = static_cast<float>(getDoubleAtTime(data->grainBlurDyeCloudsUm, time, 1.0));
+  double microStructure[2] = {0.2, 30.0};
+  if (data->grainMicroStructure) {
+    gParamHost->paramGetValueAtTime(data->grainMicroStructure, time, &microStructure[0], &microStructure[1]);
+  }
+  params.grainMicroStructureScale = static_cast<float>(microStructure[0]);
+  params.grainMicroStructureSigmaNm = static_cast<float>(microStructure[1]);
+  params.grainSeed = static_cast<uint32_t>(getIntAtTime(data->grainSeed, time, 1));
+  params.grainAnimate = getBoolAtTime(data->grainAnimate, time, false);
+  params.grainSynthesisSize = static_cast<float>(getDoubleAtTime(data->grainSynthesisSize, time, 1.0));
+  params.grainSynthesisAmount = static_cast<float>(getDoubleAtTime(data->grainSynthesisAmount, time, 1.0));
+  params.grainSynthesisSharpness = static_cast<float>(getDoubleAtTime(data->grainSynthesisSharpness, time, 1.0));
+  params.grainSynthesisQuality = static_cast<float>(getDoubleAtTime(data->grainSynthesisQuality, time, 1.0));
+  params.grainSynthesisSamples = getIntAtTime(data->grainSynthesisSamples, time, 128);
+  params.grainSynthesisMeanRadiusUm = static_cast<float>(getDoubleAtTime(data->grainSynthesisMeanRadiusUm, time, 0.25));
+  params.grainSynthesisRadiusStdDevRatio = static_cast<float>(getDoubleAtTime(data->grainSynthesisRadiusStdDevRatio, time, 0.0));
+  params.grainSynthesisObservationSigmaUm = static_cast<float>(getDoubleAtTime(data->grainSynthesisObservationSigmaUm, time, 1.0));
+  params.grainSynthesisCellSizeRatio = static_cast<float>(getDoubleAtTime(data->grainSynthesisCellSizeRatio, time, 1.0));
+  params.grainSynthesisMaxRadiusQuantile = static_cast<float>(getDoubleAtTime(data->grainSynthesisMaxRadiusQuantile, time, 0.999));
+  params.grainSynthesisCoverageEpsilon = static_cast<float>(getDoubleAtTime(data->grainSynthesisCoverageEpsilon, time, 0.0001));
+  params.grainSynthesisMaxGrainsPerCell = getIntAtTime(data->grainSynthesisMaxGrainsPerCell, time, 32);
+  double grainSynthesisRadiusScale[3] = {1.2, 1.0, 2.5};
+  if (data->grainSynthesisRadiusScale) {
+    gParamHost->paramGetValueAtTime(data->grainSynthesisRadiusScale, time, &grainSynthesisRadiusScale[0], &grainSynthesisRadiusScale[1], &grainSynthesisRadiusScale[2]);
+  }
+  params.grainSynthesisRadiusScaleR = static_cast<float>(grainSynthesisRadiusScale[0]);
+  params.grainSynthesisRadiusScaleG = static_cast<float>(grainSynthesisRadiusScale[1]);
+  params.grainSynthesisRadiusScaleB = static_cast<float>(grainSynthesisRadiusScale[2]);
+  double grainSynthesisLayerScale[3] = {6.0, 1.0, 0.4};
+  if (data->grainSynthesisLayerScale) {
+    gParamHost->paramGetValueAtTime(data->grainSynthesisLayerScale, time, &grainSynthesisLayerScale[0], &grainSynthesisLayerScale[1], &grainSynthesisLayerScale[2]);
+  }
+  params.grainSynthesisLayerScale0 = static_cast<float>(grainSynthesisLayerScale[0]);
+  params.grainSynthesisLayerScale1 = static_cast<float>(grainSynthesisLayerScale[1]);
+  params.grainSynthesisLayerScale2 = static_cast<float>(grainSynthesisLayerScale[2]);
+  params.grainSynthesisLayered = getBoolAtTime(data->grainSynthesisLayered, time, true);
+  params.halationEnabled = getBoolAtTime(data->halationEnabled, time, true);
+  params.scatterAmount = static_cast<float>(getDoubleAtTime(data->scatterAmount, time, 1.0));
+  params.scatterScale = static_cast<float>(getDoubleAtTime(data->scatterScale, time, 1.0));
+  params.halationAmount = static_cast<float>(getDoubleAtTime(data->halationAmount, time, 1.0));
+  params.halationScale = static_cast<float>(getDoubleAtTime(data->halationScale, time, 1.0));
+  double strength[3] = {0.05, 0.015, 0.0};
+  if (data->halationStrength) {
+    gParamHost->paramGetValueAtTime(data->halationStrength, time, &strength[0], &strength[1], &strength[2]);
+  }
+  params.halationStrengthR = static_cast<float>(strength[0]);
+  params.halationStrengthG = static_cast<float>(strength[1]);
+  params.halationStrengthB = static_cast<float>(strength[2]);
+  params.cameraDiffusionEnabled = getBoolAtTime(data->cameraDiffusionEnabled, time, false);
+  params.cameraDiffusionFamily = static_cast<spektrafilm::DiffusionFilterFamily>(getIntAtTime(data->cameraDiffusionFamily, time, 1));
+  params.cameraDiffusionStrength = static_cast<float>(getDoubleAtTime(data->cameraDiffusionStrength, time, 0.5));
+  params.cameraDiffusionSpatialScale = static_cast<float>(getDoubleAtTime(data->cameraDiffusionSpatialScale, time, 1.0));
+  params.cameraDiffusionHaloWarmth = static_cast<float>(getDoubleAtTime(data->cameraDiffusionHaloWarmth, time, 0.0));
+  params.cameraDiffusionCoreIntensity = static_cast<float>(getDoubleAtTime(data->cameraDiffusionCoreIntensity, time, 1.0));
+  params.cameraDiffusionCoreSize = static_cast<float>(getDoubleAtTime(data->cameraDiffusionCoreSize, time, 1.0));
+  params.cameraDiffusionHaloIntensity = static_cast<float>(getDoubleAtTime(data->cameraDiffusionHaloIntensity, time, 1.0));
+  params.cameraDiffusionHaloSize = static_cast<float>(getDoubleAtTime(data->cameraDiffusionHaloSize, time, 1.0));
+  params.cameraDiffusionBloomIntensity = static_cast<float>(getDoubleAtTime(data->cameraDiffusionBloomIntensity, time, 1.0));
+  params.cameraDiffusionBloomSize = static_cast<float>(getDoubleAtTime(data->cameraDiffusionBloomSize, time, 1.0));
+  params.printDiffusionEnabled = getBoolAtTime(data->printDiffusionEnabled, time, false);
+  params.printDiffusionFamily = static_cast<spektrafilm::DiffusionFilterFamily>(getIntAtTime(data->printDiffusionFamily, time, 1));
+  params.printDiffusionStrength = static_cast<float>(getDoubleAtTime(data->printDiffusionStrength, time, 0.5));
+  params.printDiffusionSpatialScale = static_cast<float>(getDoubleAtTime(data->printDiffusionSpatialScale, time, 1.0));
+  params.printDiffusionHaloWarmth = static_cast<float>(getDoubleAtTime(data->printDiffusionHaloWarmth, time, 0.0));
+  params.printDiffusionCoreIntensity = static_cast<float>(getDoubleAtTime(data->printDiffusionCoreIntensity, time, 1.0));
+  params.printDiffusionCoreSize = static_cast<float>(getDoubleAtTime(data->printDiffusionCoreSize, time, 1.0));
+  params.printDiffusionHaloIntensity = static_cast<float>(getDoubleAtTime(data->printDiffusionHaloIntensity, time, 1.0));
+  params.printDiffusionHaloSize = static_cast<float>(getDoubleAtTime(data->printDiffusionHaloSize, time, 1.0));
+  params.printDiffusionBloomIntensity = static_cast<float>(getDoubleAtTime(data->printDiffusionBloomIntensity, time, 1.0));
+  params.printDiffusionBloomSize = static_cast<float>(getDoubleAtTime(data->printDiffusionBloomSize, time, 1.0));
+  params.scannerEnabled = getBoolAtTime(data->scannerEnabled, time, false);
+  params.scannerWhiteCorrection = getBoolAtTime(data->scannerWhiteCorrection, time, false);
+  params.scannerBlackCorrection = getBoolAtTime(data->scannerBlackCorrection, time, false);
+  params.scannerWhiteLevel = static_cast<float>(getDoubleAtTime(data->scannerWhiteLevel, time, 0.98));
+  params.scannerBlackLevel = static_cast<float>(getDoubleAtTime(data->scannerBlackLevel, time, 0.01));
+  params.glarePercent = static_cast<float>(getDoubleAtTime(data->glarePercent, time, 0.03));
+  params.scannerMtf50LpMm = static_cast<float>(getDoubleAtTime(data->scannerMtf50LpMm, time, 60.0));
+  params.scannerUnsharpRadiusUm = static_cast<float>(getDoubleAtTime(data->scannerUnsharpRadiusUm, time, 5.0));
+  params.scannerUnsharpAmount = static_cast<float>(getDoubleAtTime(data->scannerUnsharpAmount, time, 0.7));
+  return params;
+}
+
+bool validStoredKind(ParamValueKind kind) {
+  switch (kind) {
+    case ParamValueKind::Int:
+    case ParamValueKind::Bool:
+    case ParamValueKind::Double:
+    case ParamValueKind::Double2D:
+    case ParamValueKind::Double3D:
+      return true;
+  }
+  return false;
+}
+
+std::string encodeDefaultsSnapshot(const DefaultsSnapshot &snapshot) {
+  std::ostringstream out;
+  out << "SPKDFLT2\n";
+  for (const auto &item : snapshot) {
+    const std::string &name = item.first;
+    const StoredParamValue &value = item.second;
+    const int components = paramComponentCount(value.kind);
+    out << name << ' ' << static_cast<int>(value.kind) << ' ' << components;
+    if (paramKindUsesDouble(value.kind)) {
+      out << std::setprecision(std::numeric_limits<double>::max_digits10);
+      for (int i = 0; i < components; ++i) {
+        out << ' ' << value.doubleValue[i];
+      }
+    } else {
+      for (int i = 0; i < components; ++i) {
+        out << ' ' << value.intValue[i];
+      }
+    }
+    out << '\n';
+  }
+  return out.str();
+}
+
+bool decodeDefaultsSnapshot(const std::string &text, DefaultsSnapshot &snapshot) {
+  std::istringstream in(text);
+  std::string line;
+  if (!std::getline(in, line) || line != "SPKDFLT2") {
+    return false;
+  }
+  DefaultsSnapshot decoded;
+  while (std::getline(in, line)) {
+    if (line.empty()) {
+      continue;
+    }
+    std::istringstream row(line);
+    std::string name;
+    int kindRaw = 0;
+    int components = 0;
+    if (!(row >> name >> kindRaw >> components)) {
+      continue;
+    }
+    StoredParamValue value{};
+    value.kind = static_cast<ParamValueKind>(kindRaw);
+    if (!validStoredKind(value.kind) || components != paramComponentCount(value.kind)) {
+      continue;
+    }
+    const ParamDefault *factory = defaultForParam(name.c_str());
+    if (!factory || factory->kind != value.kind) {
+      continue;
+    }
+    bool ok = true;
+    if (paramKindUsesDouble(value.kind)) {
+      for (int c = 0; c < components; ++c) {
+        if (!(row >> value.doubleValue[c])) {
+          ok = false;
+          break;
+        }
+      }
+    } else {
+      for (int c = 0; c < components; ++c) {
+        if (!(row >> value.intValue[c])) {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (!ok) {
+      continue;
+    }
+    decoded[name] = value;
+  }
+  snapshot = std::move(decoded);
+  return true;
+}
+
+std::filesystem::path userDefaultsPath() {
+#if defined _WIN32
+  const char *base = std::getenv("APPDATA");
+  if (base && base[0]) {
+    return std::filesystem::path(base) / "SpektraFilm" / "ofx-defaults-v1.spkdefaults";
+  }
+  const char *home = std::getenv("USERPROFILE");
+  return std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" / "SpektraFilm" / "ofx-defaults-v1.spkdefaults";
+#else
+  const char *home = std::getenv("HOME");
+  return std::filesystem::path(home && home[0] ? home : ".") /
+    "Library" / "Application Support" / "SpektraFilm" / "ofx-defaults-v1.spkdefaults";
+#endif
+}
+
+void obfuscateDefaultsText(std::string &text) {
+  constexpr uint8_t key[] = {
+    0x53, 0x70, 0x65, 0x6b, 0x74, 0x72, 0x61, 0x46,
+    0x69, 0x6c, 0x6d, 0x4f, 0x46, 0x58, 0x31, 0x21
+  };
+  for (size_t i = 0; i < text.size(); ++i) {
+    const uint8_t stream = static_cast<uint8_t>(key[i % sizeof(key)] + static_cast<uint8_t>((i * 37u) & 0xffu));
+    text[i] = static_cast<char>(static_cast<uint8_t>(text[i]) ^ stream);
+  }
+}
+
+bool loadSnapshotFromFile(const std::filesystem::path &path, DefaultsSnapshot &snapshot, bool &found, std::string &error) {
+  found = false;
+  error.clear();
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    return true;
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    error = "Could not open Spektra defaults file for reading: " + path.string();
+    return false;
+  }
+  std::string text{
+    std::istreambuf_iterator<char>(input),
+    std::istreambuf_iterator<char>()
+  };
+  if (!input.good() && !input.eof()) {
+    error = "Could not read Spektra defaults file: " + path.string();
+    return false;
+  }
+  obfuscateDefaultsText(text);
+  DefaultsSnapshot decoded;
+  if (!decodeDefaultsSnapshot(text, decoded)) {
+    error = "Spektra defaults file is not a recognized defaults snapshot: " + path.string();
+    return false;
+  }
+  snapshot = std::move(decoded);
+  found = true;
+  return true;
+}
+
+bool saveSnapshotToFile(const std::filesystem::path &path, const DefaultsSnapshot &snapshot, std::string &error) {
+  error.clear();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  if (ec) {
+    error = "Could not create Spektra defaults folder: " + path.parent_path().string();
+    return false;
+  }
+  std::string text = encodeDefaultsSnapshot(snapshot);
+  obfuscateDefaultsText(text);
+  const std::filesystem::path tempPath = path.string() + ".tmp";
+  {
+    std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = "Could not open Spektra defaults file for writing: " + tempPath.string();
+      return false;
+    }
+    output.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!output) {
+      error = "Could not write Spektra defaults file: " + tempPath.string();
+      return false;
+    }
+  }
+  std::filesystem::rename(tempPath, path, ec);
+  if (ec) {
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tempPath, path, ec);
+  }
+  if (ec) {
+    error = "Could not replace Spektra defaults file: " + path.string();
+    return false;
+  }
+  return true;
+}
+
+bool deleteSnapshotFile(const std::filesystem::path &path, std::string &error) {
+  error.clear();
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  if (ec) {
+    error = "Could not delete Spektra defaults file: " + path.string();
+    return false;
+  }
+  return true;
+}
+
+bool loadDefaultsFromFile(DefaultsSnapshot &snapshot, bool &found, std::string &error) {
+  return loadSnapshotFromFile(userDefaultsPath(), snapshot, found, error);
+}
+
+bool saveDefaultsToFile(const DefaultsSnapshot &snapshot, std::string &error) {
+  return saveSnapshotToFile(userDefaultsPath(), snapshot, error);
+}
+
+bool deleteDefaultsFile(std::string &error) {
+  return deleteSnapshotFile(userDefaultsPath(), error);
+}
+
+std::string clipboardStatusMessage(const char *prefix, OSStatus status) {
+  return std::string(prefix) + " (clipboard status " + std::to_string(static_cast<long long>(status)) + ").";
+}
+
+bool writeTextToClipboard(const std::string &text, std::string &error) {
+  error.clear();
+  PasteboardRef pasteboard = nullptr;
+  OSStatus status = PasteboardCreate(kPasteboardClipboard, &pasteboard);
+  if (status != noErr || !pasteboard) {
+    error = clipboardStatusMessage("Could not open system clipboard", status);
+    return false;
+  }
+  status = PasteboardClear(pasteboard);
+  if (status == noErr) {
+    CFDataRef data = CFDataCreate(nullptr, reinterpret_cast<const UInt8 *>(text.data()), static_cast<CFIndex>(text.size()));
+    if (data) {
+      PasteboardItemID itemId = reinterpret_cast<PasteboardItemID>(1);
+      status = PasteboardPutItemFlavor(pasteboard, itemId, CFSTR("com.spektrafilm.ofx-params"), data, 0);
+      if (status == noErr) {
+        status = PasteboardPutItemFlavor(pasteboard, itemId, CFSTR("public.utf8-plain-text"), data, 0);
+      }
+      CFRelease(data);
+    } else {
+      status = memFullErr;
+    }
+  }
+  CFRelease(pasteboard);
+  if (status != noErr) {
+    error = clipboardStatusMessage("Could not write Spektra params to system clipboard", status);
+    return false;
+  }
+  return true;
+}
+
+bool copyClipboardFlavor(PasteboardRef pasteboard, PasteboardItemID item, CFStringRef flavor, std::string &text) {
+  CFDataRef data = nullptr;
+  const OSStatus status = PasteboardCopyItemFlavorData(pasteboard, item, flavor, &data);
+  if (status != noErr || !data) {
+    return false;
+  }
+  const UInt8 *bytes = CFDataGetBytePtr(data);
+  const CFIndex length = CFDataGetLength(data);
+  text.assign(reinterpret_cast<const char *>(bytes), static_cast<size_t>(length));
+  CFRelease(data);
+  return true;
+}
+
+bool readTextFromClipboard(std::string &text, bool &found, std::string &error) {
+  text.clear();
+  found = false;
+  error.clear();
+  PasteboardRef pasteboard = nullptr;
+  OSStatus status = PasteboardCreate(kPasteboardClipboard, &pasteboard);
+  if (status != noErr || !pasteboard) {
+    error = clipboardStatusMessage("Could not open system clipboard", status);
+    return false;
+  }
+  PasteboardSynchronize(pasteboard);
+  ItemCount itemCount = 0;
+  status = PasteboardGetItemCount(pasteboard, &itemCount);
+  if (status != noErr) {
+    CFRelease(pasteboard);
+    error = clipboardStatusMessage("Could not inspect system clipboard", status);
+    return false;
+  }
+  for (ItemCount index = 1; index <= itemCount; ++index) {
+    PasteboardItemID item = nullptr;
+    if (PasteboardGetItemIdentifier(pasteboard, static_cast<CFIndex>(index), &item) != noErr || !item) {
+      continue;
+    }
+    if (copyClipboardFlavor(pasteboard, item, CFSTR("com.spektrafilm.ofx-params"), text) ||
+        copyClipboardFlavor(pasteboard, item, CFSTR("public.utf8-plain-text"), text)) {
+      found = true;
+      break;
+    }
+  }
+  CFRelease(pasteboard);
+  return true;
+}
+
+void showMessage(OfxImageEffectHandle effect, const char *type, const char *id, const std::string &message) {
+  if (gMessageHost) {
+    gMessageHost->message(effect, type, id, "%s", message.c_str());
+  }
+}
+
+bool getParamValueAtTime(OfxParamHandle handle, OfxTime time, const ParamDefault &entry, StoredParamValue &value) {
+  if (!handle) {
+    return false;
+  }
+  value.kind = entry.kind;
+  switch (entry.kind) {
+    case ParamValueKind::Int:
+    case ParamValueKind::Bool: {
+      int current = entry.intDefault;
+      if (gParamHost->paramGetValueAtTime(handle, time, &current) != kOfxStatOK) {
+        return false;
+      }
+      value.intValue[0] = current;
+      return true;
+    }
+    case ParamValueKind::Double: {
+      double current = entry.doubleDefault[0];
+      if (gParamHost->paramGetValueAtTime(handle, time, &current) != kOfxStatOK) {
+        return false;
+      }
+      value.doubleValue[0] = current;
+      return true;
+    }
+    case ParamValueKind::Double2D: {
+      double x = entry.doubleDefault[0];
+      double y = entry.doubleDefault[1];
+      if (gParamHost->paramGetValueAtTime(handle, time, &x, &y) != kOfxStatOK) {
+        return false;
+      }
+      value.doubleValue[0] = x;
+      value.doubleValue[1] = y;
+      return true;
+    }
+    case ParamValueKind::Double3D: {
+      double x = entry.doubleDefault[0];
+      double y = entry.doubleDefault[1];
+      double z = entry.doubleDefault[2];
+      if (gParamHost->paramGetValueAtTime(handle, time, &x, &y, &z) != kOfxStatOK) {
+        return false;
+      }
+      value.doubleValue[0] = x;
+      value.doubleValue[1] = y;
+      value.doubleValue[2] = z;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool setParamValue(OfxParamHandle handle, const StoredParamValue &value) {
+  if (!handle) {
+    return false;
+  }
+  switch (value.kind) {
+    case ParamValueKind::Int:
+    case ParamValueKind::Bool:
+      return gParamHost->paramSetValue(handle, value.intValue[0]) == kOfxStatOK;
+    case ParamValueKind::Double:
+      return gParamHost->paramSetValue(handle, value.doubleValue[0]) == kOfxStatOK;
+    case ParamValueKind::Double2D:
+      return gParamHost->paramSetValue(handle, value.doubleValue[0], value.doubleValue[1]) == kOfxStatOK;
+    case ParamValueKind::Double3D:
+      return gParamHost->paramSetValue(handle, value.doubleValue[0], value.doubleValue[1], value.doubleValue[2]) == kOfxStatOK;
+  }
+  return false;
+}
+
+void setParamParent(OfxPropertySetHandle props, const char *parent) {
+  if (parent && parent[0]) {
+    gPropHost->propSetString(props, kOfxParamPropParent, 0, parent);
+  }
+}
+
+void setParamDescriptorHidden(OfxPropertySetHandle props, bool hidden) {
+  gPropHost->propSetInt(props, kOfxParamPropSecret, 0, hidden ? 1 : 0);
+  gPropHost->propSetInt(props, kOfxParamPropEnabled, 0, hidden ? 0 : 1);
+}
+
+void setParamHint(OfxPropertySetHandle props, const char *name) {
+  const char *hint = spektrafilm::tooltipForParam(name);
+  if (hint && hint[0]) {
+    gPropHost->propSetString(props, kOfxParamPropHint, 0, hint);
+  }
+}
+
+void defineGroup(OfxParamSetHandle paramSet, const char *name, const char *label, bool openByDefault) {
+  if (!shouldDefineGroup(name)) {
+    return;
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamDescriptorHidden(props, !groupVisibleInFlavor(name));
+  gPropHost->propSetInt(props, kOfxParamPropGroupOpen, 0, openByDefault ? 1 : 0);
+}
+
+void defineChoice(OfxParamSetHandle paramSet, const char *name, const char *label, const char **options, int optionCount, int defaultValue, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  if (optionCount <= 0) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    defaultValue = stored.intValue[0];
+  }
+  defaultValue = std::clamp(defaultValue, 0, optionCount - 1);
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  for (int i = 0; i < optionCount; ++i) {
+    gPropHost->propSetString(props, kOfxParamPropChoiceOption, i, options[i]);
+  }
+  gPropHost->propSetInt(props, kOfxParamPropDefault, 0, defaultValue);
+}
+
+void defineDouble(OfxParamSetHandle paramSet, const char *name, const char *label, double defaultValue, double min, double max, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    defaultValue = stored.doubleValue[0];
+  }
+  defaultValue = std::clamp(defaultValue, min, max);
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeDouble, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 0, defaultValue);
+  gPropHost->propSetDouble(props, kOfxParamPropMin, 0, min);
+  gPropHost->propSetDouble(props, kOfxParamPropMax, 0, max);
+  gPropHost->propSetDouble(props, kOfxParamPropDisplayMin, 0, min);
+  gPropHost->propSetDouble(props, kOfxParamPropDisplayMax, 0, max);
+}
+
+void defineInt(OfxParamSetHandle paramSet, const char *name, const char *label, int defaultValue, int min, int max, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    defaultValue = stored.intValue[0];
+  }
+  defaultValue = std::clamp(defaultValue, min, max);
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeInteger, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetInt(props, kOfxParamPropDefault, 0, defaultValue);
+  gPropHost->propSetInt(props, kOfxParamPropMin, 0, min);
+  gPropHost->propSetInt(props, kOfxParamPropMax, 0, max);
+  gPropHost->propSetInt(props, kOfxParamPropDisplayMin, 0, min);
+  gPropHost->propSetInt(props, kOfxParamPropDisplayMax, 0, max);
+}
+
+void defineBool(OfxParamSetHandle paramSet, const char *name, const char *label, bool defaultValue, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    defaultValue = stored.intValue[0] != 0;
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetInt(props, kOfxParamPropDefault, 0, defaultValue ? 1 : 0);
+}
+
+void defineLabel(OfxParamSetHandle paramSet, const char *name, const char *descriptor, const char *value, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeString, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, descriptor);
+  gPropHost->propSetString(props, kOfxPropShortLabel, 0, descriptor);
+  gPropHost->propSetString(props, kOfxPropLongLabel, 0, descriptor);
+  gPropHost->propSetString(props, kOfxParamPropDefault, 0, value);
+  gPropHost->propSetString(props, kOfxParamPropStringMode, 0, kOfxParamStringIsSingleLine);
+  gPropHost->propSetInt(props, kOfxParamPropEnabled, 0, 0);
+  gPropHost->propSetInt(props, kOfxParamPropPersistant, 0, 0);
+  gPropHost->propSetInt(props, kOfxParamPropEvaluateOnChange, 0, 0);
+  setParamParent(props, parent);
+}
+
+void defineSingleLineString(OfxParamSetHandle paramSet, const char *name, const char *label, const char *defaultValue, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeString, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetString(props, kOfxParamPropStringMode, 0, kOfxParamStringIsSingleLine);
+  gPropHost->propSetString(props, kOfxParamPropDefault, 0, defaultValue);
+  gPropHost->propSetInt(props, kOfxParamPropEvaluateOnChange, 0, 0);
+}
+
+void definePushButton(OfxParamSetHandle paramSet, const char *name, const char *label, const char *parent = nullptr) {
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetInt(props, kOfxParamPropPersistant, 0, 0);
+  gPropHost->propSetInt(props, kOfxParamPropEvaluateOnChange, 0, 1);
+}
+
+void defineHiddenBool(OfxParamSetHandle paramSet, const char *name, bool value) {
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    value = stored.intValue[0] != 0;
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, name);
+  setParamDescriptorHidden(props, true);
+  gPropHost->propSetInt(props, kOfxParamPropDefault, 0, value ? 1 : 0);
+}
+
+void defineRGB(OfxParamSetHandle paramSet, const char *name, const char *label, double r, double g, double b, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    r = stored.doubleValue[0];
+    g = stored.doubleValue[1];
+    b = stored.doubleValue[2];
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeRGB, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 0, r);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 1, g);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 2, b);
+}
+
+void defineDouble3D(OfxParamSetHandle paramSet, const char *name, const char *label, double x, double y, double z, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    x = stored.doubleValue[0];
+    y = stored.doubleValue[1];
+    z = stored.doubleValue[2];
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeDouble3D, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 0, x);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 1, y);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 2, z);
+}
+
+void defineDouble3DRange(
+  OfxParamSetHandle paramSet,
+  const char *name,
+  const char *label,
+  double x,
+  double y,
+  double z,
+  double min,
+  double max,
+  const char *parent = nullptr
+) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    x = stored.doubleValue[0];
+    y = stored.doubleValue[1];
+    z = stored.doubleValue[2];
+  }
+  x = std::clamp(x, min, max);
+  y = std::clamp(y, min, max);
+  z = std::clamp(z, min, max);
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeDouble3D, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 0, x);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 1, y);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 2, z);
+  for (int i = 0; i < 3; ++i) {
+    gPropHost->propSetDouble(props, kOfxParamPropMin, i, min);
+    gPropHost->propSetDouble(props, kOfxParamPropMax, i, max);
+    gPropHost->propSetDouble(props, kOfxParamPropDisplayMin, i, min);
+    gPropHost->propSetDouble(props, kOfxParamPropDisplayMax, i, max);
+  }
+}
+
+void defineDouble2D(OfxParamSetHandle paramSet, const char *name, const char *label, double x, double y, const char *parent = nullptr) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    x = stored.doubleValue[0];
+    y = stored.doubleValue[1];
+  }
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeDouble2D, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 0, x);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 1, y);
+}
+
+void defineDouble2DRange(
+  OfxParamSetHandle paramSet,
+  const char *name,
+  const char *label,
+  double x,
+  double y,
+  double min,
+  double max,
+  const char *parent = nullptr
+) {
+  if (!shouldDefineParam(name)) {
+    return;
+  }
+  StoredParamValue stored{};
+  if (storedValueForDefault(name, stored)) {
+    x = stored.doubleValue[0];
+    y = stored.doubleValue[1];
+  }
+  x = std::clamp(x, min, max);
+  y = std::clamp(y, min, max);
+  OfxPropertySetHandle props = nullptr;
+  gParamHost->paramDefine(paramSet, kOfxParamTypeDouble2D, name, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, label);
+  setParamHint(props, name);
+  setParamParent(props, parent);
+  setParamDescriptorHidden(props, parameterHiddenInFlavor(name));
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 0, x);
+  gPropHost->propSetDouble(props, kOfxParamPropDefault, 1, y);
+  for (int i = 0; i < 2; ++i) {
+    gPropHost->propSetDouble(props, kOfxParamPropMin, i, min);
+    gPropHost->propSetDouble(props, kOfxParamPropMax, i, max);
+    gPropHost->propSetDouble(props, kOfxParamPropDisplayMin, i, min);
+    gPropHost->propSetDouble(props, kOfxParamPropDisplayMax, i, max);
+  }
+}
+
+void cacheParam(OfxParamSetHandle paramSet, const char *name, OfxParamHandle &handle) {
+  gParamHost->paramGetHandle(paramSet, name, &handle, nullptr);
+}
+
+OfxParamHandle paramHandleForName(OfxParamSetHandle paramSet, const char *name) {
+  OfxParamHandle handle = nullptr;
+  if (gParamHost->paramGetHandle(paramSet, name, &handle, nullptr) != kOfxStatOK) {
+    return nullptr;
+  }
+  return handle;
+}
+
+bool applySnapshotToParamSet(OfxParamSetHandle paramSet, const DefaultsSnapshot &snapshot) {
+  bool appliedAny = false;
+  for (const ParamDefault &entry : kParamDefaults) {
+    if (!shouldDefineParam(entry.name)) {
+      continue;
+    }
+    const auto found = snapshot.find(entry.name);
+    if (found == snapshot.end() || found->second.kind != entry.kind) {
+      continue;
+    }
+    OfxParamHandle handle = paramHandleForName(paramSet, entry.name);
+    if (handle && setParamValue(handle, found->second)) {
+      appliedAny = true;
+    }
+  }
+  return appliedAny;
+}
+
+bool resetParamSetToFactory(OfxParamSetHandle paramSet) {
+  bool resetAny = false;
+  for (const ParamDefault &entry : kParamDefaults) {
+    if (!shouldDefineParam(entry.name)) {
+      continue;
+    }
+    OfxParamHandle handle = paramHandleForName(paramSet, entry.name);
+    if (handle && setParamValue(handle, factoryStoredValue(entry))) {
+      resetAny = true;
+    }
+  }
+  return resetAny;
+}
+
+void captureParamSetSnapshot(OfxParamSetHandle paramSet, OfxTime time, DefaultsSnapshot &snapshot) {
+  for (const ParamDefault &entry : kParamDefaults) {
+    if (!shouldDefineParam(entry.name)) {
+      continue;
+    }
+    OfxParamHandle handle = paramHandleForName(paramSet, entry.name);
+    StoredParamValue value{};
+    if (handle && getParamValueAtTime(handle, time, entry, value)) {
+      snapshot[entry.name] = value;
+    }
+  }
+}
+
+bool saveVisibleDefaults(OfxParamSetHandle paramSet, OfxTime time, std::string &error) {
+  DefaultsSnapshot snapshot;
+  bool found = false;
+  if (!loadDefaultsFromFile(snapshot, found, error)) {
+    return false;
+  }
+  captureParamSetSnapshot(paramSet, time, snapshot);
+  return saveDefaultsToFile(snapshot, error);
+}
+
+bool copyVisibleParams(OfxParamSetHandle paramSet, OfxTime time, std::string &error) {
+  DefaultsSnapshot snapshot;
+  captureParamSetSnapshot(paramSet, time, snapshot);
+  std::string text = encodeDefaultsSnapshot(snapshot);
+  obfuscateDefaultsText(text);
+  return writeTextToClipboard(text, error);
+}
+
+const char *pluginFlavorName() {
+  switch (kPluginFlavor) {
+    case PluginFlavor::Flow:
+      return "SpektraFlow";
+    case PluginFlavor::Pro:
+      return "SpektraPro";
+    case PluginFlavor::FilmDev:
+      return "SpektraFilm";
+  }
+  return "SpektraFilm";
+}
+
+const char *processName(spektrafilm::ProcessMode process) {
+  return process == spektrafilm::ProcessMode::ScanNegative ? "Scan negative" : "Print simulation";
+}
+
+const char *outputRoleName(spektrafilm::OutputRole role) {
+  switch (role) {
+    case spektrafilm::OutputRole::DisplayHdr:
+      return "Display Out HDR";
+    case spektrafilm::OutputRole::SceneHandoff:
+      return "Scene Handoff (Dev)";
+    case spektrafilm::OutputRole::DisplaySdr:
+    default:
+      return "Display Out SDR";
+  }
+}
+
+const char *colorSpaceName(spektrafilm::ColorSpace colorSpace) {
+  switch (colorSpace) {
+    case spektrafilm::ColorSpace::ArriLogC4:
+      return "ARRI LogC4";
+    case spektrafilm::ColorSpace::ArriLogC3Ei800:
+      return "ARRI LogC3 EI800";
+    case spektrafilm::ColorSpace::BmdFilmWideGamutGen5:
+      return "BMDFilm WideGamut Gen5";
+    case spektrafilm::ColorSpace::DavinciIntermediateWideGamut:
+      return "DaVinci Intermediate WideGamut";
+    case spektrafilm::ColorSpace::RedLog3G10RedWideGamutRgb:
+      return "RED Log3G10 REDWideGamutRGB";
+    case spektrafilm::ColorSpace::SonySLog3SGamut3:
+      return "Sony S-Log3 S-Gamut3";
+    case spektrafilm::ColorSpace::SonySLog3SGamut3Cine:
+      return "Sony S-Log3 S-Gamut3.Cine";
+    case spektrafilm::ColorSpace::CanonLog2CinemaGamutD55:
+      return "Canon Log2 CinemaGamut D55";
+    case spektrafilm::ColorSpace::CanonLog3CinemaGamutD55:
+      return "Canon Log3 CinemaGamut D55";
+    case spektrafilm::ColorSpace::PanasonicVLogVGamut:
+      return "Panasonic V-Log V-Gamut";
+    case spektrafilm::ColorSpace::Aces2065_1:
+      return "ACES2065-1";
+    case spektrafilm::ColorSpace::AcesCg:
+      return "ACEScg";
+    case spektrafilm::ColorSpace::LinearRec2020:
+      return "Linear Rec.2020";
+    case spektrafilm::ColorSpace::LinearRec709:
+      return "Linear Rec.709";
+    case spektrafilm::ColorSpace::LinearP3D65:
+      return "Linear P3-D65";
+    case spektrafilm::ColorSpace::Srgb:
+      return "sRGB";
+    case spektrafilm::ColorSpace::DisplayP3:
+      return "Display P3";
+    case spektrafilm::ColorSpace::ProPhotoRgb:
+      return "ProPhoto RGB";
+    case spektrafilm::ColorSpace::AdobeRgb1998:
+      return "Adobe RGB (1998)";
+    case spektrafilm::ColorSpace::DciP3:
+      return "DCI-P3";
+    case spektrafilm::ColorSpace::P3D65Gamma22:
+      return "P3-D65 Gamma 2.2";
+    case spektrafilm::ColorSpace::P3D65Gamma26:
+      return "P3-D65 Gamma 2.6";
+    case spektrafilm::ColorSpace::Rec709Gamma22:
+      return "Rec.709 Gamma 2.2";
+    case spektrafilm::ColorSpace::Rec709Gamma24:
+      return "Rec.709 Gamma 2.4";
+  }
+  return "Unknown";
+}
+
+std::string sanitizePathComponent(std::string value) {
+  for (char &ch : value) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c)) {
+      continue;
+    }
+    ch = '_';
+  }
+  while (value.find("__") != std::string::npos) {
+    value.replace(value.find("__"), 2, "_");
+  }
+  while (!value.empty() && value.front() == '_') {
+    value.erase(value.begin());
+  }
+  while (!value.empty() && value.back() == '_') {
+    value.pop_back();
+  }
+  return value.empty() ? "unknown" : value;
+}
+
+std::string getProfileName(const spektrafilm::ProfileCurveSet *profile, const char *fallback) {
+  return profile && profile->name && profile->name[0] ? profile->name : fallback;
+}
+
+std::string currentDatePrefix() {
+  std::time_t now = std::time(nullptr);
+  std::tm local{};
+#if defined _WIN32
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+  std::ostringstream out;
+  out << std::put_time(&local, "%y%m%d");
+  return out.str();
+}
+
+std::string randomExportCode() {
+  static std::mt19937 generator{std::random_device{}()};
+  static std::uniform_int_distribution<int> distribution(0, 0xffffff);
+  std::ostringstream out;
+  out << std::uppercase << std::hex << std::setw(6) << std::setfill('0') << distribution(generator);
+  return out.str();
+}
+
+std::filesystem::path envPath(const char *name, const std::filesystem::path &fallback) {
+  const char *value = std::getenv(name);
+  return std::filesystem::path(value && value[0] ? value : fallback.string());
+}
+
+std::filesystem::path homeFolder() {
+#if defined _WIN32
+  return envPath("USERPROFILE", ".");
+#else
+  return envPath("HOME", ".");
+#endif
+}
+
+std::filesystem::path userLutFolder() {
+#if defined _WIN32
+  return homeFolder() / "Documents" / "SpektraFilm";
+#else
+  return homeFolder() / "Movies" / "SpektraFilm";
+#endif
+}
+
+std::filesystem::path lutDestinationFolder(int destination) {
+  const std::filesystem::path homePath = homeFolder();
+  switch (destination) {
+    case 1:
+#if defined _WIN32
+      return envPath("PROGRAMDATA", "C:\\ProgramData") /
+        "Blackmagic Design" / "DaVinci Resolve" / "Support" / "LUT" / "SpektraFilm";
+#else
+      return std::filesystem::path("/") / "Library" / "Application Support" /
+        "Blackmagic Design" / "DaVinci Resolve" / "LUT" / "SpektraFilm";
+#endif
+    case 2:
+      return homePath / ".nuke" / "SpektraFilm";
+    case 3:
+#if defined _WIN32
+      return envPath("PROGRAMFILES", "C:\\Program Files") /
+        "Adobe" / "Common" / "LUTs" / "Creative" / "SpektraFilm";
+#else
+      return std::filesystem::path("/") / "Library" / "Application Support" /
+        "Adobe" / "Common" / "LUTs" / "Creative" / "SpektraFilm";
+#endif
+    case 4:
+#if defined _WIN32
+      return userLutFolder();
+#else
+      return homePath / "Library" / "Application Support" /
+        "ProApps" / "Custom LUTs" / "SpektraFilm";
+#endif
+    case 0:
+    default:
+      return userLutFolder();
+  }
+}
+
+std::filesystem::path generatedLutExportPath(int destination, const std::string &identifier) {
+  const std::filesystem::path folder = lutDestinationFolder(destination);
+  const std::string cleanIdentifier = sanitizePathComponent(identifier.empty() ? "SpektraFilm" : identifier);
+  const std::string date = currentDatePrefix();
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    std::filesystem::path path = folder / (date + "_" + cleanIdentifier + "_" + randomExportCode() + ".cube");
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+      return path;
+    }
+  }
+  return folder / (date + "_" + cleanIdentifier + "_" + randomExportCode() + ".cube");
+}
+
+std::filesystem::path bundledUserManualPath() {
+  Dl_info imageInfo{};
+  if (dladdr(&gPluginImageAnchor, &imageInfo) == 0 || !imageInfo.dli_fname) {
+    return {};
+  }
+  const std::filesystem::path imagePath(imageInfo.dli_fname);
+  const std::filesystem::path contentsPath = imagePath.parent_path().parent_path();
+  if (contentsPath.empty()) {
+    return {};
+  }
+  return contentsPath / "Resources" / "SpektraFilm_User_Manual.pdf";
+}
+
+bool openBundledUserManual(std::string &error) {
+  const std::filesystem::path manualPath = bundledUserManualPath();
+  if (manualPath.empty() || !std::filesystem::is_regular_file(manualPath)) {
+    error = "Could not find SpektraFilm_User_Manual.pdf in the OFX bundle resources.";
+    return false;
+  }
+
+  const std::string pathString = manualPath.string();
+  CFURLRef manualUrl = CFURLCreateFromFileSystemRepresentation(
+    kCFAllocatorDefault,
+    reinterpret_cast<const UInt8 *>(pathString.c_str()),
+    static_cast<CFIndex>(pathString.size()),
+    false
+  );
+  if (!manualUrl) {
+    error = "Could not create a file URL for the SpektraFilm user manual.";
+    return false;
+  }
+
+  const OSStatus status = LSOpenCFURLRef(manualUrl, nullptr);
+  CFRelease(manualUrl);
+  if (status != noErr) {
+    error = "Could not open the SpektraFilm user manual. LaunchServices returned " + std::to_string(status) + ".";
+    return false;
+  }
+  return true;
+}
+
+std::string getStringValue(OfxParamHandle handle) {
+  if (!handle) {
+    return {};
+  }
+  char *value = nullptr;
+  if (gParamHost->paramGetValue(handle, &value) != kOfxStatOK || !value) {
+    return {};
+  }
+  return value;
+}
+
+int currentLutSize(InstanceData *data) {
+  const int selected = getIntValue(data ? data->lutSize : nullptr, 1);
+  return selected == 0 ? 33 : 65;
+}
+
+int currentLutDestination(InstanceData *data) {
+  const int selected = getIntValue(data ? data->lutDestination : nullptr, 0);
+  return std::clamp(selected, 0, 4);
+}
+
+std::string joinLabels(const std::vector<std::string> &labels) {
+  std::ostringstream out;
+  for (size_t i = 0; i < labels.size(); ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    out << labels[i];
+  }
+  return out.str();
+}
+
+std::vector<std::string> lutDisabledEffectLabels(const spektrafilm::RenderParams &params) {
+  std::vector<std::string> labels;
+  if (params.autoExposure) {
+    labels.push_back("auto exposure");
+  }
+  if (params.grainEnabled) {
+    labels.push_back("grain");
+  }
+  if (params.halationEnabled && (params.scatterAmount > 0.0f || params.halationAmount > 0.0f)) {
+    labels.push_back("halation");
+  }
+  if (params.cameraDiffusionEnabled && params.cameraDiffusionStrength > 0.0f) {
+    labels.push_back("camera diffusion");
+  }
+  if (params.printDiffusionEnabled && params.printDiffusionStrength > 0.0f) {
+    labels.push_back("print diffusion");
+  }
+  if (params.dirCouplersAmount > 0.0f && params.dirCouplersDiffusionUm > 0.0f) {
+    labels.push_back("DIR diffusion");
+  }
+  if (std::abs(params.enlargerScale - 1.0f) > 1.0e-6f ||
+      std::abs(params.enlargerOffsetXPercent) > 1.0e-6f ||
+      std::abs(params.enlargerOffsetYPercent) > 1.0e-6f) {
+    labels.push_back("film-plane transform");
+  }
+  if (params.scannerEnabled && params.scannerMtf50LpMm > 0.0f) {
+    labels.push_back("scanner blur");
+  }
+  if (params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f) {
+    labels.push_back("scanner unsharp");
+  }
+  return labels;
+}
+
+spektrafilm::RenderParams lutSafeParams(spektrafilm::RenderParams params) {
+  params.autoExposure = false;
+  params.grainEnabled = false;
+  params.grainModel = spektrafilm::GrainModel::Preview;
+  params.grainAnimate = false;
+  params.halationEnabled = false;
+  params.scatterAmount = 0.0f;
+  params.halationAmount = 0.0f;
+  params.cameraDiffusionEnabled = false;
+  params.printDiffusionEnabled = false;
+  params.dirCouplersDiffusionUm = 0.0f;
+  params.enlargerScale = 1.0f;
+  params.enlargerOffsetXPercent = 0.0f;
+  params.enlargerOffsetYPercent = 0.0f;
+  params.scannerMtf50LpMm = 0.0f;
+  params.scannerUnsharpRadiusUm = 0.0f;
+  params.scannerUnsharpAmount = 0.0f;
+  return params;
+}
+
+bool writeCubeLut(
+  const std::filesystem::path &path,
+  int lutSize,
+  const spektrafilm::RenderParams &sourceParams,
+  const std::vector<float> &pixels,
+  const std::vector<std::string> &disabledEffects,
+  std::string &error
+) {
+  error.clear();
+  std::error_code ec;
+  if (!path.parent_path().empty()) {
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+      error = "Could not create LUT export folder: " + path.parent_path().string();
+      return false;
+    }
+  }
+
+  const std::filesystem::path tempPath = path.string() + ".tmp";
+  std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    error = "Could not open LUT file for writing: " + tempPath.string();
+    return false;
+  }
+
+  out << "TITLE \"" << pluginFlavorName() << ' ' << lutSize << "pt "
+      << colorSpaceName(sourceParams.inputColorSpace) << " to "
+      << colorSpaceName(sourceParams.outputColorSpace) << "\"\n";
+  out << "# Generated by " << pluginFlavorName() << " OFX " << SPEKTRAFILM_VERSION_STRING << "\n";
+  out << "# Process: " << processName(sourceParams.process) << "\n";
+  out << "# Output role: " << outputRoleName(sourceParams.outputRole) << "\n";
+  out << "# Input color space: " << colorSpaceName(sourceParams.inputColorSpace) << "\n";
+  out << "# Output color space: " << colorSpaceName(sourceParams.outputColorSpace) << "\n";
+  out << "# Film: " << getProfileName(spektrafilm::filmProfileCurves(sourceParams.film), "Unknown Film") << "\n";
+  out << "# Paper: " << getProfileName(spektrafilm::paperProfileCurves(sourceParams.paper), "Unknown Paper") << "\n";
+  if (!disabledEffects.empty()) {
+    out << "# Disabled for LUT export: " << joinLabels(disabledEffects) << "\n";
+  }
+  out << "LUT_3D_SIZE " << lutSize << "\n";
+  out << "DOMAIN_MIN 0 0 0\n";
+  out << "DOMAIN_MAX 1 1 1\n";
+  out << std::setprecision(9);
+
+  const size_t sampleCount = static_cast<size_t>(lutSize) * static_cast<size_t>(lutSize) * static_cast<size_t>(lutSize);
+  if (pixels.size() < sampleCount * 4u) {
+    error = "Rendered LUT buffer is smaller than expected.";
+    return false;
+  }
+  for (size_t i = 0; i < sampleCount; ++i) {
+    const float r = pixels[i * 4u];
+    const float g = pixels[i * 4u + 1u];
+    const float b = pixels[i * 4u + 2u];
+    if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) {
+      error = "Rendered LUT contains non-finite values.";
+      return false;
+    }
+    out << r << ' ' << g << ' ' << b << '\n';
+  }
+  if (!out) {
+    error = "Could not write LUT file: " + tempPath.string();
+    return false;
+  }
+  out.close();
+
+  std::filesystem::rename(tempPath, path, ec);
+  if (ec) {
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tempPath, path, ec);
+  }
+  if (ec) {
+    error = "Could not replace LUT file: " + path.string();
+    return false;
+  }
+  return true;
+}
+
+bool exportCurrentLut(InstanceData *data, OfxTime time, std::filesystem::path &path, std::vector<std::string> &disabledEffects, std::string &error) {
+  error.clear();
+  disabledEffects.clear();
+  if (!data || !data->renderer) {
+    error = "LUT export is not available because the renderer is not initialized.";
+    return false;
+  }
+
+  const int lutSize = currentLutSize(data);
+  spektrafilm::RenderParams params = readParams(data, time);
+  if (params.outputRole != spektrafilm::OutputRole::DisplaySdr) {
+    error = "LUT export is only available for Display Out SDR. Select an SDR output color space before exporting.";
+    return false;
+  }
+
+  path = generatedLutExportPath(currentLutDestination(data), getStringValue(data->lutIdentifier));
+  disabledEffects = lutDisabledEffectLabels(params);
+  spektrafilm::RenderParams renderParams = lutSafeParams(params);
+
+  const int width = lutSize * lutSize;
+  const int height = lutSize;
+  const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+  std::vector<float> source(pixelCount * 4u, 1.0f);
+  std::vector<float> destination(pixelCount * 4u, 0.0f);
+  const float denominator = static_cast<float>(std::max(lutSize - 1, 1));
+  for (int b = 0; b < lutSize; ++b) {
+    for (int g = 0; g < lutSize; ++g) {
+      for (int r = 0; r < lutSize; ++r) {
+        const size_t index = static_cast<size_t>(b) * static_cast<size_t>(lutSize) * static_cast<size_t>(lutSize) +
+          static_cast<size_t>(g) * static_cast<size_t>(lutSize) + static_cast<size_t>(r);
+        source[index * 4u] = static_cast<float>(r) / denominator;
+        source[index * 4u + 1u] = static_cast<float>(g) / denominator;
+        source[index * 4u + 2u] = static_cast<float>(b) / denominator;
+        source[index * 4u + 3u] = 1.0f;
+      }
+    }
+  }
+
+  spektrafilm::ImageView sourceView{};
+  sourceView.data = source.data();
+  sourceView.width = width;
+  sourceView.height = height;
+  sourceView.rowBytes = width * static_cast<int32_t>(4 * sizeof(float));
+  sourceView.components = 4;
+  sourceView.bytesPerComponent = 4;
+
+  spektrafilm::MutableImageView destinationView{};
+  destinationView.data = destination.data();
+  destinationView.width = width;
+  destinationView.height = height;
+  destinationView.rowBytes = width * static_cast<int32_t>(4 * sizeof(float));
+  destinationView.components = 4;
+  destinationView.bytesPerComponent = 4;
+
+  spektrafilm::RenderWindow window{0, 0, width, height};
+  if (!data->renderer->render(sourceView, destinationView, window, renderParams, time)) {
+    error = data->renderer->lastError().empty() ? "Could not render LUT samples." : data->renderer->lastError();
+    return false;
+  }
+
+  return writeCubeLut(path, lutSize, params, destination, disabledEffects, error);
+}
+
+OfxStatus createInstance(OfxImageEffectHandle effect) {
+  auto *data = new InstanceData();
+  OfxPropertySetHandle effectProps = nullptr;
+  OfxParamSetHandle paramSet = nullptr;
+  gEffectHost->getPropertySet(effect, &effectProps);
+  gEffectHost->getParamSet(effect, &paramSet);
+
+  gEffectHost->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &data->sourceClip, nullptr);
+  gEffectHost->clipGetHandle(effect, kOfxImageEffectOutputClipName, &data->outputClip, nullptr);
+
+  cacheParam(paramSet, "process", data->process);
+  cacheParam(paramSet, "rgbToRawMethod", data->rgbToRawMethod);
+  cacheParam(paramSet, "inputColorSpace", data->inputColorSpace);
+  cacheParam(paramSet, "outputRole", data->outputRole);
+  cacheParam(paramSet, "sdrOutputColorSpace", data->sdrOutputColorSpace);
+  cacheParam(paramSet, "sceneOutputColorSpace", data->sceneOutputColorSpace);
+  cacheParam(paramSet, "hdrPreset", data->hdrPreset);
+  cacheParam(paramSet, "hdrTransfer", data->hdrTransfer);
+  cacheParam(paramSet, "hdrReferenceWhiteNits", data->hdrReferenceWhiteNits);
+  cacheParam(paramSet, "hdrPeakNits", data->hdrPeakNits);
+  cacheParam(paramSet, "hdrExposureEv", data->hdrExposureEv);
+  cacheParam(paramSet, "hdrToneMapping", data->hdrToneMapping);
+  cacheParam(paramSet, "cameraUvFilterEnabled", data->cameraUvFilterEnabled);
+  cacheParam(paramSet, "cameraUvCutNm", data->cameraUvCutNm);
+  cacheParam(paramSet, "cameraIrFilterEnabled", data->cameraIrFilterEnabled);
+  cacheParam(paramSet, "cameraIrCutNm", data->cameraIrCutNm);
+  cacheParam(paramSet, "film", data->film);
+  cacheParam(paramSet, "paper", data->paper);
+  cacheParam(paramSet, "printTiming", data->printTiming);
+  cacheParam(paramSet, "filmExposureEv", data->filmExposureEv);
+  cacheParam(paramSet, "autoExposure", data->autoExposure);
+  cacheParam(paramSet, "autoExposureMethod", data->autoExposureMethod);
+  cacheParam(paramSet, "printExposureEv", data->printExposureEv);
+  cacheParam(paramSet, "filmPushPullMode", data->filmPushPullMode);
+  cacheParam(paramSet, "filmPushPullStops", data->filmPushPullStops);
+  cacheParam(paramSet, "printPushPullStops", data->printPushPullStops);
+  cacheParam(paramSet, "negativeBleachBypassAmount", data->negativeBleachBypassAmount);
+  cacheParam(paramSet, "negativeLeucoCyanCoupling", data->negativeLeucoCyanCoupling);
+  cacheParam(paramSet, "printBleachBypassAmount", data->printBleachBypassAmount);
+  cacheParam(paramSet, "filmGamma", data->filmGamma);
+  cacheParam(paramSet, "printGamma", data->printGamma);
+  cacheParam(paramSet, "printShadowShape", data->printShadowShape);
+  cacheParam(paramSet, "printHighlightShape", data->printHighlightShape);
+  cacheParam(paramSet, "filterC", data->filterC);
+  cacheParam(paramSet, "filterMShift", data->filterMShift);
+  cacheParam(paramSet, "filterYShift", data->filterYShift);
+  cacheParam(paramSet, "enlargerScale", data->enlargerScale);
+  cacheParam(paramSet, "enlargerOffsetXPercent", data->enlargerOffsetXPercent);
+  cacheParam(paramSet, "enlargerOffsetYPercent", data->enlargerOffsetYPercent);
+  cacheParam(paramSet, "preflashExposure", data->preflashExposure);
+  cacheParam(paramSet, "preflashMFilterShift", data->preflashMFilterShift);
+  cacheParam(paramSet, "preflashYFilterShift", data->preflashYFilterShift);
+  cacheParam(paramSet, "printerLightR", data->printerLightR);
+  cacheParam(paramSet, "printerLightG", data->printerLightG);
+  cacheParam(paramSet, "printerLightB", data->printerLightB);
+  cacheParam(paramSet, "printerLightsGang", data->printerLightsGang);
+  cacheParam(paramSet, "printerLightsGroup", data->printerLightsGroup);
+  cacheParam(paramSet, "printerLightCalibration", data->printerLightCalibration);
+  cacheParam(paramSet, "dirAmount", data->dirAmount);
+  cacheParam(paramSet, "dirDiffusionUm", data->dirDiffusionUm);
+  cacheParam(paramSet, "dirInhibitionSameLayer", data->dirInhibitionSameLayer);
+  cacheParam(paramSet, "dirInhibitionInterlayer", data->dirInhibitionInterlayer);
+  cacheParam(paramSet, "dirGammaSameLayerRgb", data->dirGammaSameLayerRgb);
+  cacheParam(paramSet, "dirGammaRToGb", data->dirGammaRToGb);
+  cacheParam(paramSet, "dirGammaGToRb", data->dirGammaGToRb);
+  cacheParam(paramSet, "dirGammaBToRg", data->dirGammaBToRg);
+  cacheParam(paramSet, "dirCalibrateToStock", data->dirCalibrateToStock);
+  cacheParam(paramSet, "dirUsesStockCalibration", data->dirUsesStockCalibration);
+  cacheParam(paramSet, "grainEnabled", data->grainEnabled);
+  cacheParam(paramSet, "grainModel", data->grainModel);
+  cacheParam(paramSet, "filmFormat", data->filmFormat);
+  cacheParam(paramSet, "grainSublayersEnabled", data->grainSublayersEnabled);
+  cacheParam(paramSet, "grainSubLayerCount", data->grainSubLayerCount);
+  cacheParam(paramSet, "grainParticleAreaUm2", data->grainParticleAreaUm2);
+  cacheParam(paramSet, "grainParticleScale", data->grainParticleScale);
+  cacheParam(paramSet, "grainParticleScaleLayers", data->grainParticleScaleLayers);
+  cacheParam(paramSet, "grainDensityMin", data->grainDensityMin);
+  cacheParam(paramSet, "grainUniformity", data->grainUniformity);
+  cacheParam(paramSet, "grainFinalBlurUm", data->grainFinalBlurUm);
+  cacheParam(paramSet, "grainBlurDyeCloudsUm", data->grainBlurDyeCloudsUm);
+  cacheParam(paramSet, "grainMicroStructure", data->grainMicroStructure);
+  cacheParam(paramSet, "grainSeed", data->grainSeed);
+  cacheParam(paramSet, "grainAnimate", data->grainAnimate);
+  cacheParam(paramSet, "grainSynthesisSize", data->grainSynthesisSize);
+  cacheParam(paramSet, "grainSynthesisAmount", data->grainSynthesisAmount);
+  cacheParam(paramSet, "grainSynthesisSharpness", data->grainSynthesisSharpness);
+  cacheParam(paramSet, "grainSynthesisQuality", data->grainSynthesisQuality);
+  cacheParam(paramSet, "grainSynthesisSamples", data->grainSynthesisSamples);
+  cacheParam(paramSet, "grainSynthesisMeanRadiusUm", data->grainSynthesisMeanRadiusUm);
+  cacheParam(paramSet, "grainSynthesisRadiusStdDevRatio", data->grainSynthesisRadiusStdDevRatio);
+  cacheParam(paramSet, "grainSynthesisObservationSigmaUm", data->grainSynthesisObservationSigmaUm);
+  cacheParam(paramSet, "grainSynthesisCellSizeRatio", data->grainSynthesisCellSizeRatio);
+  cacheParam(paramSet, "grainSynthesisMaxRadiusQuantile", data->grainSynthesisMaxRadiusQuantile);
+  cacheParam(paramSet, "grainSynthesisCoverageEpsilon", data->grainSynthesisCoverageEpsilon);
+  cacheParam(paramSet, "grainSynthesisMaxGrainsPerCell", data->grainSynthesisMaxGrainsPerCell);
+  cacheParam(paramSet, "grainSynthesisRadiusScale", data->grainSynthesisRadiusScale);
+  cacheParam(paramSet, "grainSynthesisLayerScale", data->grainSynthesisLayerScale);
+  cacheParam(paramSet, "grainSynthesisLayered", data->grainSynthesisLayered);
+  cacheParam(paramSet, "halationEnabled", data->halationEnabled);
+  cacheParam(paramSet, "scatterAmount", data->scatterAmount);
+  cacheParam(paramSet, "scatterScale", data->scatterScale);
+  cacheParam(paramSet, "halationAmount", data->halationAmount);
+  cacheParam(paramSet, "halationScale", data->halationScale);
+  cacheParam(paramSet, "halationStrength", data->halationStrength);
+  cacheParam(paramSet, "cameraDiffusionEnabled", data->cameraDiffusionEnabled);
+  cacheParam(paramSet, "cameraDiffusionFamily", data->cameraDiffusionFamily);
+  cacheParam(paramSet, "cameraDiffusionStrength", data->cameraDiffusionStrength);
+  cacheParam(paramSet, "cameraDiffusionSpatialScale", data->cameraDiffusionSpatialScale);
+  cacheParam(paramSet, "cameraDiffusionHaloWarmth", data->cameraDiffusionHaloWarmth);
+  cacheParam(paramSet, "cameraDiffusionCoreIntensity", data->cameraDiffusionCoreIntensity);
+  cacheParam(paramSet, "cameraDiffusionCoreSize", data->cameraDiffusionCoreSize);
+  cacheParam(paramSet, "cameraDiffusionHaloIntensity", data->cameraDiffusionHaloIntensity);
+  cacheParam(paramSet, "cameraDiffusionHaloSize", data->cameraDiffusionHaloSize);
+  cacheParam(paramSet, "cameraDiffusionBloomIntensity", data->cameraDiffusionBloomIntensity);
+  cacheParam(paramSet, "cameraDiffusionBloomSize", data->cameraDiffusionBloomSize);
+  cacheParam(paramSet, "printDiffusionEnabled", data->printDiffusionEnabled);
+  cacheParam(paramSet, "printDiffusionFamily", data->printDiffusionFamily);
+  cacheParam(paramSet, "printDiffusionStrength", data->printDiffusionStrength);
+  cacheParam(paramSet, "printDiffusionSpatialScale", data->printDiffusionSpatialScale);
+  cacheParam(paramSet, "printDiffusionHaloWarmth", data->printDiffusionHaloWarmth);
+  cacheParam(paramSet, "printDiffusionCoreIntensity", data->printDiffusionCoreIntensity);
+  cacheParam(paramSet, "printDiffusionCoreSize", data->printDiffusionCoreSize);
+  cacheParam(paramSet, "printDiffusionHaloIntensity", data->printDiffusionHaloIntensity);
+  cacheParam(paramSet, "printDiffusionHaloSize", data->printDiffusionHaloSize);
+  cacheParam(paramSet, "printDiffusionBloomIntensity", data->printDiffusionBloomIntensity);
+  cacheParam(paramSet, "printDiffusionBloomSize", data->printDiffusionBloomSize);
+  cacheParam(paramSet, "scannerEnabled", data->scannerEnabled);
+  cacheParam(paramSet, "scannerWhiteCorrection", data->scannerWhiteCorrection);
+  cacheParam(paramSet, "scannerBlackCorrection", data->scannerBlackCorrection);
+  cacheParam(paramSet, "scannerWhiteLevel", data->scannerWhiteLevel);
+  cacheParam(paramSet, "scannerBlackLevel", data->scannerBlackLevel);
+  cacheParam(paramSet, "glarePercent", data->glarePercent);
+  cacheParam(paramSet, "scannerMtf50LpMm", data->scannerMtf50LpMm);
+  cacheParam(paramSet, "scannerUnsharpRadiusUm", data->scannerUnsharpRadiusUm);
+  cacheParam(paramSet, "scannerUnsharpAmount", data->scannerUnsharpAmount);
+  cacheParam(paramSet, "lutSize", data->lutSize);
+  cacheParam(paramSet, "lutDestination", data->lutDestination);
+  cacheParam(paramSet, "lutIdentifier", data->lutIdentifier);
+  cacheParam(paramSet, "exportLut", data->exportLut);
+
+  DefaultsSnapshot savedDefaults;
+  bool defaultsFound = false;
+  std::string defaultsError;
+  if (loadDefaultsFromFile(savedDefaults, defaultsFound, defaultsError) && defaultsFound) {
+    applySnapshotToParamSet(paramSet, savedDefaults);
+  }
+  if (dirUsesStockCalibration(data)) {
+    applyDirStockCalibration(data, false);
+  }
+
+  data->renderer = std::make_unique<spektrafilm::MetalRenderer>();
+  rememberCurrentPrinterLights(data);
+  syncConditionalParamVisibility(data);
+  gPropHost->propSetPointer(effectProps, kOfxPropInstanceData, 0, data);
+  return kOfxStatOK;
+}
+
+OfxStatus destroyInstance(OfxImageEffectHandle effect) {
+  InstanceData *data = getInstanceData(effect);
+  delete data;
+  return kOfxStatOK;
+}
+
+OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
+  InstanceData *data = getInstanceData(effect);
+  if (!data) {
+    return kOfxStatReplyDefault;
+  }
+  char *changedName = nullptr;
+  char *changeReason = nullptr;
+  if (inArgs) {
+    gPropHost->propGetString(inArgs, kOfxPropName, 0, &changedName);
+    gPropHost->propGetString(inArgs, kOfxPropChangeReason, 0, &changeReason);
+  }
+  if (changeReason && std::strcmp(changeReason, kOfxChangePluginEdited) == 0) {
+    return kOfxStatReplyDefault;
+  }
+
+  const bool copyParamsChanged = changedName && std::strcmp(changedName, "copyParams") == 0;
+  const bool pasteParamsChanged = changedName && std::strcmp(changedName, "pasteParams") == 0;
+  const bool saveDefaultsChanged = changedName && std::strcmp(changedName, "saveDefaults") == 0;
+  const bool resetDefaultsChanged = changedName && std::strcmp(changedName, "resetDefaults") == 0;
+  const bool exportLutChanged = changedName && std::strcmp(changedName, "exportLut") == 0;
+  const bool openManualChanged = changedName && std::strcmp(changedName, "openUserManual") == 0;
+  if (copyParamsChanged || pasteParamsChanged || saveDefaultsChanged || resetDefaultsChanged ||
+      exportLutChanged || openManualChanged) {
+    OfxParamSetHandle paramSet = nullptr;
+    gEffectHost->getParamSet(effect, &paramSet);
+    OfxTime time = 0.0;
+    if (inArgs) {
+      gPropHost->propGetDouble(inArgs, kOfxPropTime, 0, &time);
+    }
+    if (copyParamsChanged) {
+      std::string error;
+      if (copyVisibleParams(paramSet, time, error)) {
+        return kOfxStatOK;
+      }
+      showMessage(effect, kOfxMessageError, "SpektraFilmDefaults", error.empty() ? "Could not copy Spektra params." : error);
+      return kOfxStatFailed;
+    }
+    if (pasteParamsChanged) {
+      DefaultsSnapshot copiedParams;
+      bool copyFound = false;
+      std::string error;
+      std::string clipboardText;
+      if (!readTextFromClipboard(clipboardText, copyFound, error)) {
+        showMessage(effect, kOfxMessageError, "SpektraFilmDefaults", error.empty() ? "Could not read copied Spektra params." : error);
+        return kOfxStatFailed;
+      }
+      if (!copyFound) {
+        showMessage(effect, kOfxMessageWarning, "SpektraFilmDefaults", "No copied Spektra params found.");
+        return kOfxStatReplyDefault;
+      }
+      obfuscateDefaultsText(clipboardText);
+      if (!decodeDefaultsSnapshot(clipboardText, copiedParams)) {
+        showMessage(effect, kOfxMessageWarning, "SpektraFilmDefaults", "Clipboard does not contain Spektra params.");
+        return kOfxStatReplyDefault;
+      }
+      gParamHost->paramEditBegin(paramSet, "Paste Spektra Params");
+      applySnapshotToParamSet(paramSet, copiedParams);
+      gParamHost->paramEditEnd(paramSet);
+      syncConditionalParamVisibility(data);
+      return kOfxStatOK;
+    }
+    if (saveDefaultsChanged) {
+      std::string error;
+      if (saveVisibleDefaults(paramSet, time, error)) {
+        showMessage(effect, kOfxMessageMessage, "SpektraFilmDefaults", "Spektra defaults saved successfully.");
+        return kOfxStatOK;
+      }
+      showMessage(effect, kOfxMessageError, "SpektraFilmDefaults", error.empty() ? "Could not save Spektra defaults." : error);
+      return kOfxStatFailed;
+    }
+    if (exportLutChanged) {
+      std::filesystem::path path;
+      std::vector<std::string> disabledEffects;
+      std::string error;
+      if (!exportCurrentLut(data, time, path, disabledEffects, error)) {
+        showMessage(effect, kOfxMessageError, "SpektraFilmLutExport", error.empty() ? "Could not export Spektra LUT." : error);
+        return kOfxStatFailed;
+      }
+      std::string message = "Spektra LUT exported: " + path.string();
+      if (!disabledEffects.empty()) {
+        message += "\n\nThis LUT contains the color-only spectral transform. Disabled for export: " + joinLabels(disabledEffects) + ".";
+        showMessage(effect, kOfxMessageWarning, "SpektraFilmLutExport", message);
+      } else {
+        showMessage(effect, kOfxMessageMessage, "SpektraFilmLutExport", message);
+      }
+      return kOfxStatOK;
+    }
+    if (openManualChanged) {
+      std::string error;
+      if (openBundledUserManual(error)) {
+        return kOfxStatOK;
+      }
+      showMessage(effect, kOfxMessageError, "SpektraFilmUserManual", error.empty() ? "Could not open the SpektraFilm user manual." : error);
+      return kOfxStatFailed;
+    }
+    std::string error;
+    if (!deleteDefaultsFile(error)) {
+      showMessage(
+        effect,
+        kOfxMessageError,
+        "SpektraFilmDefaults",
+        error.empty() ? "Could not delete Spektra defaults file." : error
+      );
+      return kOfxStatFailed;
+    }
+    gParamHost->paramEditBegin(paramSet, "Reset Spektra Factory Defaults");
+    resetParamSetToFactory(paramSet);
+    if (dirUsesStockCalibration(data)) {
+      applyDirStockCalibration(data, false);
+    }
+    gParamHost->paramEditEnd(paramSet);
+    syncConditionalParamVisibility(data);
+    showMessage(effect, kOfxMessageMessage, "SpektraFilmDefaults", "Spektra factory defaults restored.");
+    return kOfxStatOK;
+  }
+
+  syncConditionalParamVisibility(data);
+
+  const bool hdrPresetChanged = changedName && std::strcmp(changedName, "hdrPreset") == 0;
+  const bool hdrControlChanged = changedName && (
+    std::strcmp(changedName, "hdrTransfer") == 0 ||
+    std::strcmp(changedName, "hdrReferenceWhiteNits") == 0 ||
+    std::strcmp(changedName, "hdrPeakNits") == 0 ||
+    std::strcmp(changedName, "hdrExposureEv") == 0 ||
+    std::strcmp(changedName, "hdrToneMapping") == 0
+  );
+  if (hdrPresetChanged && data->hdrPreset && data->hdrTransfer && data->hdrReferenceWhiteNits &&
+      data->hdrPeakNits && data->hdrToneMapping) {
+    int preset = 0;
+    gParamHost->paramGetValue(data->hdrPreset, &preset);
+    if (preset != static_cast<int>(spektrafilm::HdrPreset::Custom)) {
+      const HdrPresetValues values = hdrPresetValues(preset);
+      gParamHost->paramSetValue(data->hdrTransfer, values.transfer);
+      gParamHost->paramSetValue(data->hdrReferenceWhiteNits, values.referenceWhiteNits);
+      gParamHost->paramSetValue(data->hdrPeakNits, values.peakNits);
+      gParamHost->paramSetValue(data->hdrToneMapping, values.toneMapping);
+      return kOfxStatOK;
+    }
+  } else if (hdrControlChanged && data->hdrPreset) {
+    int preset = 0;
+    gParamHost->paramGetValue(data->hdrPreset, &preset);
+    if (preset != static_cast<int>(spektrafilm::HdrPreset::Custom)) {
+      gParamHost->paramSetValue(data->hdrPreset, static_cast<int>(spektrafilm::HdrPreset::Custom));
+      return kOfxStatOK;
+    }
+  }
+
+  const bool filmChanged = changedName && std::strcmp(changedName, "film") == 0;
+  const bool dirCalibrateChanged = changedName && std::strcmp(changedName, "dirCalibrateToStock") == 0;
+  const bool dirCoefficientChanged = changedName && (
+    std::strcmp(changedName, "dirGammaSameLayerRgb") == 0 ||
+    std::strcmp(changedName, "dirGammaRToGb") == 0 ||
+    std::strcmp(changedName, "dirGammaGToRb") == 0 ||
+    std::strcmp(changedName, "dirGammaBToRg") == 0
+  );
+  if (dirCalibrateChanged) {
+    return applyDirStockCalibration(data, true) ? kOfxStatOK : kOfxStatReplyDefault;
+  }
+  if (dirCoefficientChanged && data->dirUsesStockCalibration && !data->syncingDirCalibration) {
+    gParamHost->paramSetValue(data->dirUsesStockCalibration, 0);
+    return kOfxStatOK;
+  }
+  if (filmChanged && dirUsesStockCalibration(data)) {
+    return applyDirStockCalibration(data, false) ? kOfxStatOK : kOfxStatReplyDefault;
+  }
+
+  if (!data->printerLightR || !data->printerLightG || !data->printerLightB ||
+      !data->printerLightsGang || !data->printerLightsGroup) {
+    return kOfxStatReplyDefault;
+  }
+  if (data->syncingPrinterLights) {
+    return kOfxStatOK;
+  }
+  const bool printerLightRChanged = changedName && std::strcmp(changedName, "printerLightR") == 0;
+  const bool printerLightGChanged = changedName && std::strcmp(changedName, "printerLightG") == 0;
+  const bool printerLightBChanged = changedName && std::strcmp(changedName, "printerLightB") == 0;
+  const bool printerLightsChanged = printerLightRChanged || printerLightGChanged || printerLightBChanged;
+  const bool gangChanged = changedName && std::strcmp(changedName, "printerLightsGang") == 0;
+  const bool groupChanged = changedName && std::strcmp(changedName, "printerLightsGroup") == 0;
+  if (!printerLightsChanged && !gangChanged && !groupChanged) {
+    return kOfxStatReplyDefault;
+  }
+
+  double current[3] = {0.0, 0.0, 0.0};
+  if (!readCurrentPrinterLights(data, current)) {
+    return kOfxStatReplyDefault;
+  }
+
+  bool gangEnabled = getBoolValue(data->printerLightsGang, false);
+  bool groupEnabled = getBoolValue(data->printerLightsGroup, false);
+  if (gangChanged && gangEnabled && groupEnabled) {
+    data->syncingPrinterLights = true;
+    gParamHost->paramSetValue(data->printerLightsGroup, 0);
+    data->syncingPrinterLights = false;
+    groupEnabled = false;
+  } else if (groupChanged && groupEnabled && gangEnabled) {
+    data->syncingPrinterLights = true;
+    gParamHost->paramSetValue(data->printerLightsGang, 0);
+    data->syncingPrinterLights = false;
+    gangEnabled = false;
+  }
+
+  if (!gangEnabled && !groupEnabled) {
+    rememberCurrentPrinterLights(data, current);
+    return kOfxStatReplyDefault;
+  }
+
+  if (gangEnabled) {
+    double linkedValue = (current[0] + current[1] + current[2]) / 3.0;
+    if (printerLightRChanged) {
+      linkedValue = current[0];
+    } else if (printerLightGChanged) {
+      linkedValue = current[1];
+    } else if (printerLightBChanged) {
+      linkedValue = current[2];
+    }
+
+    double linked[3] = {linkedValue, linkedValue, linkedValue};
+    rememberCurrentPrinterLights(data, linked);
+    data->syncingPrinterLights = true;
+    if (std::abs(current[0] - linkedValue) > 1.0e-9) {
+      gParamHost->paramSetValue(data->printerLightR, linkedValue);
+    }
+    if (std::abs(current[1] - linkedValue) > 1.0e-9) {
+      gParamHost->paramSetValue(data->printerLightG, linkedValue);
+    }
+    if (std::abs(current[2] - linkedValue) > 1.0e-9) {
+      gParamHost->paramSetValue(data->printerLightB, linkedValue);
+    }
+    data->syncingPrinterLights = false;
+    return kOfxStatOK;
+  }
+
+  if (!printerLightsChanged || !data->lastPrinterLightsInitialized) {
+    rememberCurrentPrinterLights(data, current);
+    return kOfxStatReplyDefault;
+  }
+
+  int changedIndex = 0;
+  if (printerLightGChanged) {
+    changedIndex = 1;
+  } else if (printerLightBChanged) {
+    changedIndex = 2;
+  }
+  const double delta = current[changedIndex] - data->lastPrinterLights[changedIndex];
+  if (std::abs(delta) <= 1.0e-9) {
+    rememberCurrentPrinterLights(data, current);
+    return kOfxStatReplyDefault;
+  }
+
+  double grouped[3] = {
+    std::clamp(data->lastPrinterLights[0] + delta, -24.0, 24.0),
+    std::clamp(data->lastPrinterLights[1] + delta, -24.0, 24.0),
+    std::clamp(data->lastPrinterLights[2] + delta, -24.0, 24.0),
+  };
+  grouped[changedIndex] = current[changedIndex];
+  rememberCurrentPrinterLights(data, grouped);
+  data->syncingPrinterLights = true;
+  if (std::abs(current[0] - grouped[0]) > 1.0e-9) {
+    gParamHost->paramSetValue(data->printerLightR, grouped[0]);
+  }
+  if (std::abs(current[1] - grouped[1]) > 1.0e-9) {
+    gParamHost->paramSetValue(data->printerLightG, grouped[1]);
+  }
+  if (std::abs(current[2] - grouped[2]) > 1.0e-9) {
+    gParamHost->paramSetValue(data->printerLightB, grouped[2]);
+  }
+  data->syncingPrinterLights = false;
+  return kOfxStatOK;
+}
+
+double filmFormatMm(spektrafilm::FilmFormat format) {
+  switch (format) {
+    case spektrafilm::FilmFormat::Standard8:
+      return 4.8;
+    case spektrafilm::FilmFormat::Super8:
+      return 5.79;
+    case spektrafilm::FilmFormat::Standard16:
+      return 10.26;
+    case spektrafilm::FilmFormat::Super16:
+      return 12.52;
+    case spektrafilm::FilmFormat::Super35:
+      return 24.89;
+    case spektrafilm::FilmFormat::Standard65:
+      return 52.48;
+    case spektrafilm::FilmFormat::Imax70:
+      return 70.41;
+    case spektrafilm::FilmFormat::Standard35:
+    default:
+      return 35.0;
+  }
+}
+
+double enlargerScale(const spektrafilm::RenderParams &params) {
+  return std::clamp(static_cast<double>(params.enlargerScale), 1.0, 32.0);
+}
+
+bool enlargerTransformActive(const spektrafilm::RenderParams &params) {
+  return std::abs(enlargerScale(params) - 1.0) > 1.0e-6;
+}
+
+double rectWidth(const OfxRectD &rect) {
+  return std::max(rect.x2 - rect.x1, 0.0);
+}
+
+double rectHeight(const OfxRectD &rect) {
+  return std::max(rect.y2 - rect.y1, 0.0);
+}
+
+double sourceLongEdgePixels(InstanceData *data, OfxTime time, const OfxRectD &roi) {
+  double longEdge = std::max({rectWidth(roi), rectHeight(roi), 1.0});
+  if (data && data->sourceClip && gEffectHost) {
+    OfxRectD sourceRod{};
+    if (gEffectHost->clipGetRegionOfDefinition(data->sourceClip, time, &sourceRod) == kOfxStatOK) {
+      longEdge = std::max({longEdge, rectWidth(sourceRod), rectHeight(sourceRod), 1.0});
+    }
+  }
+  return longEdge;
+}
+
+double pixelSizeUmForRender(InstanceData *data, OfxTime time, const spektrafilm::RenderParams &params, const OfxRectD &roi) {
+  const double formatLongEdgeMm = filmFormatMm(params.filmFormat);
+  const double scale = enlargerScale(params);
+  return formatLongEdgeMm * 1000.0 / sourceLongEdgePixels(data, time, roi) / scale;
+}
+
+double normalQuantile(double p) {
+  p = std::clamp(p, 1.0e-9, 1.0 - 1.0e-9);
+  constexpr double a1 = -3.969683028665376e+01;
+  constexpr double a2 = 2.209460984245205e+02;
+  constexpr double a3 = -2.759285104469687e+02;
+  constexpr double a4 = 1.383577518672690e+02;
+  constexpr double a5 = -3.066479806614716e+01;
+  constexpr double a6 = 2.506628277459239e+00;
+  constexpr double b1 = -5.447609879822406e+01;
+  constexpr double b2 = 1.615858368580409e+02;
+  constexpr double b3 = -1.556989798598866e+02;
+  constexpr double b4 = 6.680131188771972e+01;
+  constexpr double b5 = -1.328068155288572e+01;
+  constexpr double c1 = -7.784894002430293e-03;
+  constexpr double c2 = -3.223964580411365e-01;
+  constexpr double c3 = -2.400758277161838e+00;
+  constexpr double c4 = -2.549732539343734e+00;
+  constexpr double c5 = 4.374664141464968e+00;
+  constexpr double c6 = 2.938163982698783e+00;
+  constexpr double d1 = 7.784695709041462e-03;
+  constexpr double d2 = 3.224671290700398e-01;
+  constexpr double d3 = 2.445134137142996e+00;
+  constexpr double d4 = 3.754408661907416e+00;
+  constexpr double pLow = 0.02425;
+  constexpr double pHigh = 1.0 - pLow;
+  if (p < pLow) {
+    const double q = std::sqrt(-2.0 * std::log(p));
+    return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+      ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+  }
+  if (p > pHigh) {
+    const double q = std::sqrt(-2.0 * std::log(1.0 - p));
+    return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+      ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+  }
+  const double q = p - 0.5;
+  const double r = q * q;
+  return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+    (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0);
+}
+
+double grainSynthesisMaxRadiusUm(const spektrafilm::RenderParams &params) {
+  const double mean = std::max(
+    static_cast<double>(params.grainSynthesisMeanRadiusUm) *
+      std::clamp(static_cast<double>(params.grainSynthesisSize), 0.25, 4.0),
+    1.0e-6
+  );
+  const double ratio = std::max(static_cast<double>(params.grainSynthesisRadiusStdDevRatio), 0.0);
+  double radius = mean;
+  if (ratio > 1.0e-6) {
+    const double varianceRatio = ratio * ratio;
+    const double sigma = std::sqrt(std::log(1.0 + varianceRatio));
+    const double mu = std::log(mean) - 0.5 * sigma * sigma;
+    radius = std::exp(mu + sigma * normalQuantile(params.grainSynthesisMaxRadiusQuantile));
+  }
+  const double channelScale = std::max({
+    static_cast<double>(params.grainSynthesisRadiusScaleR),
+    static_cast<double>(params.grainSynthesisRadiusScaleG),
+    static_cast<double>(params.grainSynthesisRadiusScaleB),
+    1.0e-6
+  });
+  const double layerScale = params.grainSynthesisLayered
+    ? std::max({
+        static_cast<double>(params.grainSynthesisLayerScale0),
+        static_cast<double>(params.grainSynthesisLayerScale1),
+        static_cast<double>(params.grainSynthesisLayerScale2),
+        1.0e-6
+      })
+    : 1.0;
+  return radius * channelScale * layerScale;
+}
+
+double grainSynthesisObservationSigmaUm(const spektrafilm::RenderParams &params) {
+  return std::max(static_cast<double>(params.grainSynthesisObservationSigmaUm), 0.0) /
+    std::max(static_cast<double>(params.grainSynthesisSharpness), 0.25);
+}
+
+double scannerSigmaUmFromMtf50(double mtf50LpMm) {
+  if (!std::isfinite(mtf50LpMm) || mtf50LpMm <= 0.0) {
+    return 0.0;
+  }
+  constexpr double kPi = 3.14159265358979323846;
+  return 1000.0 * std::sqrt(std::log(2.0) / (2.0 * kPi * kPi)) / mtf50LpMm;
+}
+
+int clampedKernelRadius(double sigmaPixels, int cap) {
+  if (!std::isfinite(sigmaPixels) || sigmaPixels <= 0.0) {
+    return 0;
+  }
+  return std::clamp(static_cast<int>(std::ceil(3.0 * sigmaPixels)), 0, cap);
+}
+
+double diffusionGroupMaxLambdaUm(spektrafilm::DiffusionFilterFamily family, int group, double size) {
+  double lambdaUm = 0.0;
+  double spread = 1.0;
+  switch (family) {
+    case spektrafilm::DiffusionFilterFamily::Glimmerglass:
+      lambdaUm = group == 0 ? 10.0 : group == 1 ? 50.0 : 260.0;
+      break;
+    case spektrafilm::DiffusionFilterFamily::ProMist:
+      lambdaUm = group == 0 ? 14.0 : group == 1 ? 150.0 : 650.0;
+      break;
+    case spektrafilm::DiffusionFilterFamily::CineBloom:
+      lambdaUm = group == 0 ? 20.0 : group == 1 ? 200.0 : 1000.0;
+      break;
+    case spektrafilm::DiffusionFilterFamily::BlackProMist:
+    default:
+      lambdaUm = group == 0 ? 16.0 : group == 1 ? 95.0 : 380.0;
+      break;
+  }
+  spread = group == 0 ? 1.5 : group == 1 ? 2.0 : 2.5;
+  return lambdaUm * spread * std::max(size, 1.0e-6);
+}
+
+int diffusionRadiusPixels(
+  spektrafilm::DiffusionFilterFamily family,
+  double strength,
+  double spatialScale,
+  double coreIntensity,
+  double coreSize,
+  double haloIntensity,
+  double haloSize,
+  double bloomIntensity,
+  double bloomSize,
+  double pixelSizeUm
+) {
+  if (strength <= 0.0 || spatialScale <= 0.0 || pixelSizeUm <= 0.0) {
+    return 0;
+  }
+  double maxLambdaUm = 0.0;
+  if (coreIntensity > 0.0) {
+    maxLambdaUm = std::max(maxLambdaUm, diffusionGroupMaxLambdaUm(family, 0, coreSize));
+  }
+  if (haloIntensity > 0.0) {
+    maxLambdaUm = std::max(maxLambdaUm, diffusionGroupMaxLambdaUm(family, 1, haloSize));
+  }
+  if (bloomIntensity > 0.0) {
+    maxLambdaUm = std::max(maxLambdaUm, diffusionGroupMaxLambdaUm(family, 2, bloomSize));
+  }
+  constexpr double kMaxExpGaussianFitSigmaScale = 2.7684;
+  return clampedKernelRadius(maxLambdaUm * kMaxExpGaussianFitSigmaScale * spatialScale / pixelSizeUm, 256);
+}
+
+int halationRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeUm) {
+  if (!params.halationEnabled || pixelSizeUm <= 0.0) {
+    return 0;
+  }
+  double maxSigmaUm = 0.0;
+  if (params.scatterAmount > 0.0f && params.scatterScale > 0.0f) {
+    constexpr double kMaxScatterTailUm = 8.8;
+    constexpr double kMaxExpGaussianFitSigmaScale = 2.7684;
+    maxSigmaUm = std::max(maxSigmaUm, kMaxScatterTailUm * kMaxExpGaussianFitSigmaScale * params.scatterScale);
+  }
+  if (params.halationAmount > 0.0f && params.halationScale > 0.0f) {
+    constexpr double kMaxProfileFirstSigmaUm = 65.0;
+    constexpr double kThirdBounceSigmaScale = 1.7320508075688772;
+    maxSigmaUm = std::max(maxSigmaUm, kMaxProfileFirstSigmaUm * kThirdBounceSigmaScale * params.halationScale);
+  }
+  return clampedKernelRadius(maxSigmaUm / pixelSizeUm, 256);
+}
+
+int dirRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeUm) {
+  if (params.dirCouplersAmount <= 0.0f || params.dirCouplersDiffusionUm <= 0.0f || pixelSizeUm <= 0.0) {
+    return 0;
+  }
+  return clampedKernelRadius(params.dirCouplersDiffusionUm / pixelSizeUm, 96);
+}
+
+int grainRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeUm) {
+  if (!params.grainEnabled) {
+    return 0;
+  }
+  if (params.grainModel == spektrafilm::GrainModel::GrainSynthesis && pixelSizeUm > 0.0) {
+    const double supportUm = grainSynthesisMaxRadiusUm(params) +
+      3.0 * grainSynthesisObservationSigmaUm(params);
+    return clampedKernelRadius(supportUm / pixelSizeUm, 256);
+  }
+  double maxSigmaPixels = pixelSizeUm > 0.0
+    ? std::max(static_cast<double>(params.grainFinalBlurUm), 0.0) / pixelSizeUm
+    : 0.0;
+  if (params.grainModel == spektrafilm::GrainModel::Production && pixelSizeUm > 0.0) {
+    maxSigmaPixels = std::max(maxSigmaPixels, static_cast<double>(params.grainBlurDyeCloudsUm) / pixelSizeUm);
+    maxSigmaPixels = std::max(maxSigmaPixels, static_cast<double>(params.grainMicroStructureScale) / pixelSizeUm);
+  }
+  return clampedKernelRadius(maxSigmaPixels, 64);
+}
+
+int scannerRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeUm) {
+  if (!params.scannerEnabled || pixelSizeUm <= 0.0) {
+    return 0;
+  }
+  return std::max(
+    clampedKernelRadius(scannerSigmaUmFromMtf50(params.scannerMtf50LpMm) / pixelSizeUm, 256),
+    clampedKernelRadius(std::max(static_cast<double>(params.scannerUnsharpRadiusUm), 0.0) / pixelSizeUm, 256)
+  );
+}
+
+int estimateSourceExpansionPixels(InstanceData *data, OfxTime time, const spektrafilm::RenderParams &params, const OfxRectD &roi) {
+  const double pixelSizeUm = pixelSizeUmForRender(data, time, params, roi);
+  int radius = 0;
+  radius = std::max(radius, halationRadiusPixels(params, pixelSizeUm));
+  radius = std::max(radius, dirRadiusPixels(params, pixelSizeUm));
+  radius = std::max(radius, grainRadiusPixels(params, pixelSizeUm));
+  radius = std::max(radius, scannerRadiusPixels(params, pixelSizeUm));
+  if (params.cameraDiffusionEnabled) {
+    radius = std::max(radius, diffusionRadiusPixels(
+      params.cameraDiffusionFamily,
+      params.cameraDiffusionStrength,
+      params.cameraDiffusionSpatialScale,
+      params.cameraDiffusionCoreIntensity,
+      params.cameraDiffusionCoreSize,
+      params.cameraDiffusionHaloIntensity,
+      params.cameraDiffusionHaloSize,
+      params.cameraDiffusionBloomIntensity,
+      params.cameraDiffusionBloomSize,
+      pixelSizeUm
+    ));
+  }
+  if (params.printDiffusionEnabled) {
+    radius = std::max(radius, diffusionRadiusPixels(
+      params.printDiffusionFamily,
+      params.printDiffusionStrength,
+      params.printDiffusionSpatialScale,
+      params.printDiffusionCoreIntensity,
+      params.printDiffusionCoreSize,
+      params.printDiffusionHaloIntensity,
+      params.printDiffusionHaloSize,
+      params.printDiffusionBloomIntensity,
+      params.printDiffusionBloomSize,
+      pixelSizeUm
+    ));
+  }
+  return radius;
+}
+
+OfxRectD mapRoiThroughEnlarger(
+  const spektrafilm::RenderParams &params,
+  const OfxRectD &roi,
+  const OfxRectD &sourceRod
+) {
+  if (!enlargerTransformActive(params)) {
+    return roi;
+  }
+  const double width = std::max(rectWidth(sourceRod), 1.0);
+  const double height = std::max(rectHeight(sourceRod), 1.0);
+  const double scale = enlargerScale(params);
+  const double offsetX = static_cast<double>(params.enlargerOffsetXPercent) * 0.01 / scale;
+  const double offsetY = static_cast<double>(params.enlargerOffsetYPercent) * 0.01 / scale;
+  const auto mapX = [&](double x) {
+    const double normalized = (x - sourceRod.x1) / width;
+    return sourceRod.x1 + (0.5 + (normalized - 0.5) / scale + offsetX) * width;
+  };
+  const auto mapY = [&](double y) {
+    const double normalized = (y - sourceRod.y1) / height;
+    return sourceRod.y1 + (0.5 + (normalized - 0.5) / scale + offsetY) * height;
+  };
+  OfxRectD mapped{};
+  mapped.x1 = std::min(mapX(roi.x1), mapX(roi.x2));
+  mapped.x2 = std::max(mapX(roi.x1), mapX(roi.x2));
+  mapped.y1 = std::min(mapY(roi.y1), mapY(roi.y2));
+  mapped.y2 = std::max(mapY(roi.y1), mapY(roi.y2));
+  return mapped;
+}
+
+OfxStatus getRegionOfDefinition(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+  InstanceData *data = getInstanceData(effect);
+  OfxTime time = 0.0;
+  gPropHost->propGetDouble(inArgs, kOfxPropTime, 0, &time);
+  OfxRectD rod{};
+  gEffectHost->clipGetRegionOfDefinition(data->sourceClip, time, &rod);
+  gPropHost->propSetDoubleN(outArgs, kOfxImageEffectPropRegionOfDefinition, 4, &rod.x1);
+  return kOfxStatOK;
+}
+
+OfxStatus getRegionOfInterest(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+  InstanceData *data = getInstanceData(effect);
+  OfxTime time = 0.0;
+  OfxRectD roi{};
+  gPropHost->propGetDouble(inArgs, kOfxPropTime, 0, &time);
+  gPropHost->propGetDoubleN(inArgs, kOfxImageEffectPropRegionOfInterest, 4, &roi.x1);
+
+  if (data) {
+    const spektrafilm::RenderParams params = readParams(data, time);
+    const int expansion = estimateSourceExpansionPixels(data, time, params, roi);
+    OfxRectD sourceRod{};
+    if (data->sourceClip && gEffectHost->clipGetRegionOfDefinition(data->sourceClip, time, &sourceRod) == kOfxStatOK) {
+      roi = mapRoiThroughEnlarger(params, roi, sourceRod);
+      const double sourceExpansion = std::ceil(static_cast<double>(expansion) / enlargerScale(params));
+      roi.x1 -= sourceExpansion;
+      roi.y1 -= sourceExpansion;
+      roi.x2 += sourceExpansion;
+      roi.y2 += sourceExpansion;
+      roi.x1 = std::max(roi.x1, sourceRod.x1);
+      roi.y1 = std::max(roi.y1, sourceRod.y1);
+      roi.x2 = std::min(roi.x2, sourceRod.x2);
+      roi.y2 = std::min(roi.y2, sourceRod.y2);
+    } else {
+      roi.x1 -= expansion;
+      roi.y1 -= expansion;
+      roi.x2 += expansion;
+      roi.y2 += expansion;
+    }
+  }
+
+  gPropHost->propSetDoubleN(outArgs, "OfxImageClipPropRoI_Source", 4, &roi.x1);
+  return kOfxStatOK;
+}
+
+OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle) {
+  InstanceData *data = getInstanceData(effect);
+  if (!data || !data->renderer) {
+    return kOfxStatFailed;
+  }
+
+  OfxTime time = 0.0;
+  OfxRectI renderWindow{};
+  gPropHost->propGetDouble(inArgs, kOfxPropTime, 0, &time);
+  gPropHost->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &renderWindow.x1);
+
+  OfxPropertySetHandle sourceImage = nullptr;
+  OfxPropertySetHandle outputImage = nullptr;
+  spektrafilm::ImageView source{};
+  spektrafilm::MutableImageView output{};
+  OfxStatus status = kOfxStatOK;
+
+  try {
+    status = fetchImageView(data->sourceClip, time, &sourceImage, source);
+    if (status != kOfxStatOK) {
+      throw status;
+    }
+    status = fetchMutableImageView(data->outputClip, time, &outputImage, output);
+    if (status != kOfxStatOK) {
+      throw status;
+    }
+
+    spektrafilm::RenderWindow window{renderWindow.x1, renderWindow.y1, renderWindow.x2, renderWindow.y2};
+    spektrafilm::RenderParams params = readParams(data, time);
+    if (!data->renderer->render(source, output, window, params, time)) {
+      if (gMessageHost) {
+        gMessageHost->message(effect, kOfxMessageError, "SpektraFilmMetal", "%s", data->renderer->lastError().c_str());
+      }
+      status = kOfxStatFailed;
+    }
+  } catch (OfxStatus caught) {
+    status = caught;
+  } catch (const std::bad_alloc &) {
+    status = kOfxStatErrMemory;
+  } catch (...) {
+    status = kOfxStatErrUnknown;
+  }
+
+  releaseImage(sourceImage);
+  releaseImage(outputImage);
+  return gEffectHost->abort(effect) ? kOfxStatOK : status;
+}
+
+OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
+  OfxPropertySetHandle props = nullptr;
+  gEffectHost->clipDefine(effect, kOfxImageEffectOutputClipName, &props);
+  gPropHost->propSetString(props, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+
+  gEffectHost->clipDefine(effect, kOfxImageEffectSimpleSourceClipName, &props);
+  gPropHost->propSetString(props, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+
+  OfxParamSetHandle paramSet = nullptr;
+  gEffectHost->getParamSet(effect, &paramSet);
+
+  DefaultsSnapshot savedDefaults;
+  bool defaultsFound = false;
+  std::string defaultsError;
+  if (loadDefaultsFromFile(savedDefaults, defaultsFound, defaultsError) && defaultsFound) {
+    gDescribeDefaults = &savedDefaults;
+  }
+
+  defineGroup(paramSet, "colorGroup", "Color Management", true);
+  defineGroup(paramSet, "filteringGroup", "Filtering", false);
+  defineGroup(paramSet, "enlargerGroup", "Film Plane", false);
+  defineGroup(paramSet, "filmGroup", "Film", true);
+  defineGroup(paramSet, "printGroup", "Print", true);
+  defineGroup(paramSet, "couplerGroup", "DIR Couplers", false);
+  defineGroup(paramSet, "grainGroup", "Grain", true);
+  defineGroup(paramSet, "grainSynthesisGroup", "Grain Synthesis", false);
+  defineGroup(paramSet, "halationGroup", "Halation", false);
+  defineGroup(paramSet, "diffusionGroup", "Diffusion", false);
+  defineGroup(paramSet, "scannerGroup", "Scanner", false);
+  defineGroup(paramSet, "infoGroup", "Info", false);
+  defineGroup(paramSet, "manageGroup", "Manage", false);
+
+  const char *processOptions[] = {"Print simulation", "Scan negative"};
+  defineChoice(paramSet, "process", "Mode", processOptions, 2, 0, "colorGroup");
+  const char *rgbToRawOptions[] = {"Hanatos 2025", "Mallett 2019"};
+  defineChoice(paramSet, "rgbToRawMethod", "RGB to Raw", rgbToRawOptions, 2, 0, "filmGroup");
+  const char *colorSpaces[] = {
+    "ARRI LogC4",
+    "ARRI LogC3 EI800",
+    "BMDFilm WideGamut Gen5",
+    "DaVinci Intermediate WideGamut",
+    "RED Log3G10 REDWideGamutRGB",
+    "Sony S-Log3 S-Gamut3",
+    "Sony S-Log3 S-Gamut3.Cine",
+    "Canon Log2 CinemaGamut D55",
+    "Canon Log3 CinemaGamut D55",
+    "Panasonic V-Log V-Gamut",
+    "ACES2065-1",
+    "ACEScg",
+    "Linear Rec.2020",
+    "Linear Rec.709",
+    "Linear P3-D65",
+    "sRGB",
+    "Display P3",
+    "ProPhoto RGB",
+    "Adobe RGB (1998)",
+    "DCI-P3",
+    "P3-D65 Gamma 2.2",
+    "P3-D65 Gamma 2.6",
+    "Rec.709 Gamma 2.2",
+    "Rec.709 Gamma 2.4"
+  };
+  const char *sceneOutputColorSpaces[] = {
+    "ARRI LogC4",
+    "ARRI LogC3 EI800",
+    "BMDFilm WideGamut Gen5",
+    "DaVinci Intermediate WideGamut",
+    "RED Log3G10 REDWideGamutRGB",
+    "Sony S-Log3 S-Gamut3",
+    "Sony S-Log3 S-Gamut3.Cine",
+    "Canon Log2 CinemaGamut D55",
+    "Canon Log3 CinemaGamut D55",
+    "Panasonic V-Log V-Gamut",
+    "ACES2065-1",
+    "ACEScg",
+    "Linear Rec.2020",
+    "Linear Rec.709",
+    "Linear P3-D65"
+  };
+  const char *sdrOutputColorSpaces[] = {
+    "sRGB",
+    "Display P3",
+    "ProPhoto RGB",
+    "Adobe RGB (1998)",
+    "DCI-P3",
+    "P3-D65 Gamma 2.2",
+    "P3-D65 Gamma 2.6",
+    "Rec.709 Gamma 2.2",
+    "Rec.709 Gamma 2.4"
+  };
+  defineChoice(paramSet, "inputColorSpace", "Input Color Space", colorSpaces, static_cast<int>(sizeof(colorSpaces) / sizeof(colorSpaces[0])), 0, "colorGroup");
+  const char *outputRoles[] = {"Display Out SDR", "Display Out HDR", "Scene Handoff (Dev)"};
+  defineChoice(paramSet, "outputRole", "Output Role", outputRoles, outputRoleOptionCountForFlavor(), 0, "colorGroup");
+  defineChoice(paramSet, "sdrOutputColorSpace", "Output Color Space", sdrOutputColorSpaces, static_cast<int>(sizeof(sdrOutputColorSpaces) / sizeof(sdrOutputColorSpaces[0])), 8, "colorGroup");
+  defineChoice(paramSet, "sceneOutputColorSpace", "Output Color Space", sceneOutputColorSpaces, static_cast<int>(sizeof(sceneOutputColorSpaces) / sizeof(sceneOutputColorSpaces[0])), 3, "colorGroup");
+  const char *hdrPresets[] = {"PQ 1000", "PQ 4000", "HLG 1000", "Custom"};
+  defineChoice(paramSet, "hdrPreset", "HDR Preset", hdrPresets, 4, 0, "colorGroup");
+  const char *hdrTransfers[] = {"Rec.2100 ST2084 (PQ)", "Rec.2100 HLG"};
+  defineChoice(paramSet, "hdrTransfer", "HDR Transfer", hdrTransfers, 2, 0, "colorGroup");
+  defineDouble(paramSet, "hdrReferenceWhiteNits", "Reference White Nits", 203.0, 48.0, 1000.0, "colorGroup");
+  defineDouble(paramSet, "hdrPeakNits", "Peak Nits", 1000.0, 100.0, 10000.0, "colorGroup");
+  defineDouble(paramSet, "hdrExposureEv", "HDR Exposure EV", 0.0, -8.0, 8.0, "colorGroup");
+  const char *hdrToneMappings[] = {"Soft Rolloff", "Hard Clip"};
+  defineChoice(paramSet, "hdrToneMapping", "HDR Tone Mapping", hdrToneMappings, 2, 1, "colorGroup");
+  defineBool(paramSet, "cameraUvFilterEnabled", "Filter UV", false, "filteringGroup");
+  defineDouble(paramSet, "cameraUvCutNm", "UV Cut nm", 410.0, 380.0, 450.0, "filteringGroup");
+  defineBool(paramSet, "cameraIrFilterEnabled", "Filter IR", false, "filteringGroup");
+  defineDouble(paramSet, "cameraIrCutNm", "IR Cut nm", 675.0, 600.0, 780.0, "filteringGroup");
+
+  std::vector<const char *> films;
+  films.reserve(spektrafilm::kSpektraFilmCount);
+  for (uint32_t i = 0; i < spektrafilm::kSpektraFilmCount; ++i) {
+    const spektrafilm::ProfileCurveSet *profile = spektrafilm::filmProfileCurves(static_cast<int32_t>(i));
+    films.push_back(profile && profile->name ? profile->name : "Unknown Film");
+  }
+  defineChoice(paramSet, "film", "Stock", films.data(), static_cast<int>(films.size()), static_cast<int>(spektrafilm::kSpektraDefaultFilmIndex), "filmGroup");
+  const char *filmFormats[] = {"8mm", "Super 8", "16mm", "Super 16", "35mm", "Super 35", "65mm", "70mm / IMAX"};
+  defineChoice(paramSet, "filmFormat", "Film Format", filmFormats, static_cast<int>(sizeof(filmFormats) / sizeof(filmFormats[0])), 4, "filmGroup");
+  const char *pushPullModes[] = {"Standard", "Experimental"};
+  defineChoice(paramSet, "filmPushPullMode", "Push / Pull Mode", pushPullModes, 2, 0, "filmGroup");
+  defineDouble(paramSet, "filmPushPullStops", "Film Push / Pull Stops", 0.0, -2.0, 2.0, "filmGroup");
+  defineDouble(paramSet, "negativeBleachBypassAmount", "Negative Bleach Bypass", 0.0, 0.0, 1.0, "filmGroup");
+  defineDouble(paramSet, "negativeLeucoCyanCoupling", "Leuco-Cyan Coupling", 1.0, 0.0, 2.0, "filmGroup");
+
+  std::vector<const char *> papers;
+  papers.reserve(spektrafilm::kSpektraPaperCount);
+  for (uint32_t i = 0; i < spektrafilm::kSpektraPaperCount; ++i) {
+    const spektrafilm::ProfileCurveSet *profile = spektrafilm::paperProfileCurves(static_cast<int32_t>(i));
+    papers.push_back(profile && profile->name ? profile->name : "Unknown Paper");
+  }
+  defineChoice(paramSet, "paper", "Paper", papers.data(), static_cast<int>(papers.size()), static_cast<int>(spektrafilm::kSpektraDefaultPaperIndex), "printGroup");
+  if constexpr (spektrafilm::kSpektraAcademyPrinterDensityEnabled) {
+    const char *printTimingModes[] = {"Filtered Enlarger", "Printer Density"};
+    defineChoice(paramSet, "printTiming", "Print Timing", printTimingModes, 2, 0, "printGroup");
+  } else {
+    const char *printTimingModes[] = {"Filtered Enlarger"};
+    defineChoice(paramSet, "printTiming", "Print Timing", printTimingModes, 1, 0, "printGroup");
+  }
+  defineDouble(paramSet, "printPushPullStops", "Print Push / Pull Stops", 0.0, -2.0, 2.0, "printGroup");
+  defineDouble(paramSet, "printBleachBypassAmount", "Print Bleach Bypass", 0.0, 0.0, 1.0, "printGroup");
+
+  defineDouble(paramSet, "filmExposureEv", "Exposure EV", 0.0, -8.0, 8.0, "filmGroup");
+  defineBool(paramSet, "autoExposure", "Auto Exposure", false, "filmGroup");
+  const char *autoExposureMethods[] = {"Center weighted", "Median"};
+  defineChoice(paramSet, "autoExposureMethod", "Auto Exposure Meter", autoExposureMethods, 2, 0, "filmGroup");
+  defineDouble(paramSet, "filmGamma", "Gamma", 1.0, 0.1, 2.0, "filmGroup");
+  defineDouble(paramSet, "printExposureEv", "Exposure EV", 1.0, -5.0, 5.0, "printGroup");
+  defineDouble(paramSet, "printGamma", "Gamma", 1.0, 0.1, 2.0, "printGroup");
+  defineDouble(paramSet, "printShadowShape", "Shadow Shape", 0.0, -1.0, 1.0, "printGroup");
+  defineDouble(paramSet, "printHighlightShape", "Highlight Shape", 0.0, -1.0, 1.0, "printGroup");
+  defineDouble(paramSet, "filterC", "C Filter", 0.0, 0.0, 120.0, "printGroup");
+  defineDouble(paramSet, "filterMShift", "M Filter Shift", 0.0, -60.0, 60.0, "printGroup");
+  defineDouble(paramSet, "filterYShift", "Y Filter Shift", 0.0, -60.0, 60.0, "printGroup");
+  defineDouble(paramSet, "enlargerScale", "Scale", 1.0, 1.0, 32.0, "enlargerGroup");
+  defineDouble(paramSet, "enlargerOffsetXPercent", "Offset X %", 0.0, -100.0, 100.0, "enlargerGroup");
+  defineDouble(paramSet, "enlargerOffsetYPercent", "Offset Y %", 0.0, -100.0, 100.0, "enlargerGroup");
+  defineDouble(paramSet, "preflashExposure", "Preflash Exposure", 0.0, 0.0, 1.0, "printGroup");
+  defineDouble(paramSet, "preflashMFilterShift", "Preflash M Filter Shift", 0.0, -60.0, 60.0, "printGroup");
+  defineDouble(paramSet, "preflashYFilterShift", "Preflash Y Filter Shift", 0.0, -60.0, 60.0, "printGroup");
+  if constexpr (spektrafilm::kSpektraAcademyPrinterDensityEnabled) {
+    defineBool(paramSet, "printerLightsGang", "Gang Printer Points", false, "printGroup");
+    defineBool(paramSet, "printerLightsGroup", "Group Printer Points", false, "printGroup");
+    defineDouble(paramSet, "printerLightR", "Printer Point R", 0.0, -24.0, 24.0, "printGroup");
+    defineDouble(paramSet, "printerLightG", "Printer Point G", 0.0, -24.0, 24.0, "printGroup");
+    defineDouble(paramSet, "printerLightB", "Printer Point B", 0.0, -24.0, 24.0, "printGroup");
+    defineBool(paramSet, "printerLightCalibration", "Printer Point Calibration", true, "printGroup");
+  }
+  defineDouble(paramSet, "dirAmount", "Amount", 0.0, 0.0, 2.0, "couplerGroup");
+  defineDouble(paramSet, "dirDiffusionUm", "Diffusion um", 20.0, 0.0, 100.0, "couplerGroup");
+  defineDouble(paramSet, "dirInhibitionSameLayer", "Same-Layer Inhibition", 1.0, 0.0, 2.0, "couplerGroup");
+  defineDouble(paramSet, "dirInhibitionInterlayer", "Interlayer Inhibition", 1.0, 0.0, 2.0, "couplerGroup");
+  defineDouble3DRange(paramSet, "dirGammaSameLayerRgb", "Same-Layer Gamma RGB", 0.336, 0.319, 0.273, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaRToGb", "R -> G/B Gamma", 0.353, 0.302, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaGToRb", "G -> R/B Gamma", 0.154, 0.353, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaBToRg", "B -> R/G Gamma", 0.168, 0.226, 0.0, 1.0, "couplerGroup");
+  definePushButton(paramSet, "dirCalibrateToStock", "Calibrate to Stock", "couplerGroup");
+  defineHiddenBool(paramSet, "dirUsesStockCalibration", true);
+  defineBool(paramSet, "grainEnabled", "Enabled", false, "grainGroup");
+  const char *grainModels[] = {"Preview", "Production", "Grain Synthesis"};
+  defineChoice(paramSet, "grainModel", "Model", grainModels, grainModelOptionCountForFlavor(), 0, "grainGroup");
+  defineBool(paramSet, "grainSublayersEnabled", "Sublayers", true, "grainGroup");
+  defineInt(paramSet, "grainSubLayerCount", "Sub Layer Count", 1, 1, 8, "grainGroup");
+  defineDouble(paramSet, "grainParticleAreaUm2", "Particle Area um2", 0.1, 0.01, 5.0, "grainGroup");
+  defineDouble3D(paramSet, "grainParticleScale", "Particle Scale RGB", 1.2, 1.0, 2.5, "grainGroup");
+  defineDouble3D(paramSet, "grainParticleScaleLayers", "Layer Scale", 6.0, 1.0, 0.4, "grainGroup");
+  defineDouble3D(paramSet, "grainDensityMin", "Density Min", 0.04, 0.05, 0.06, "grainGroup");
+  defineDouble3D(paramSet, "grainUniformity", "Uniformity RGB", 0.99, 0.97, 0.98, "grainGroup");
+  defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur um", 1.55, 0.0, 5.0, "grainGroup");
+  defineDouble(paramSet, "grainBlurDyeCloudsUm", "Dye Cloud Blur um", 1.0, 0.0, 10.0, "grainGroup");
+  defineDouble2D(paramSet, "grainMicroStructure", "Micro Structure", 0.2, 30.0, "grainGroup");
+  defineInt(paramSet, "grainSeed", "Seed", 1, 0, 1000000, "grainGroup");
+  defineBool(paramSet, "grainAnimate", "Animate", true, "grainGroup");
+  defineDouble(paramSet, "grainSynthesisSize", "Synthesis Size", 1.0, 0.25, 4.0, "grainGroup");
+  defineDouble(paramSet, "grainSynthesisAmount", "Synthesis Amount", 1.0, 0.0, 3.0, "grainGroup");
+  defineDouble(paramSet, "grainSynthesisSharpness", "Synthesis Sharpness", 1.0, 0.25, 4.0, "grainGroup");
+  defineDouble(paramSet, "grainSynthesisQuality", "Synthesis Quality", 1.0, 0.25, 4.0, "grainGroup");
+  defineInt(paramSet, "grainSynthesisSamples", "Samples", 128, 1, 2048, "grainSynthesisGroup");
+  defineDouble(paramSet, "grainSynthesisMeanRadiusUm", "Mean Radius um", 0.25, 0.05, 10.0, "grainSynthesisGroup");
+  defineDouble(paramSet, "grainSynthesisRadiusStdDevRatio", "Radius StdDev Ratio", 0.0, 0.0, 1.0, "grainSynthesisGroup");
+  defineDouble(paramSet, "grainSynthesisObservationSigmaUm", "Observation Aperture Sigma um", 1.0, 0.0, 20.0, "grainSynthesisGroup");
+  defineDouble(paramSet, "grainSynthesisCellSizeRatio", "Cell Size Ratio", 1.0, 0.25, 2.0, "grainSynthesisGroup");
+  defineDouble(paramSet, "grainSynthesisMaxRadiusQuantile", "Max Radius Quantile", 0.999, 0.95, 0.9999, "grainSynthesisGroup");
+  defineDouble(paramSet, "grainSynthesisCoverageEpsilon", "Coverage Epsilon", 0.0001, 0.000001, 0.01, "grainSynthesisGroup");
+  defineInt(paramSet, "grainSynthesisMaxGrainsPerCell", "Max Grains Per Cell", 32, 1, 128, "grainSynthesisGroup");
+  defineDouble3D(paramSet, "grainSynthesisRadiusScale", "Radius Scale RGB", 1.2, 1.0, 2.5, "grainSynthesisGroup");
+  defineDouble3D(paramSet, "grainSynthesisLayerScale", "Layer Scale", 6.0, 1.0, 0.4, "grainSynthesisGroup");
+  defineBool(paramSet, "grainSynthesisLayered", "Layered", true, "grainSynthesisGroup");
+  defineBool(paramSet, "halationEnabled", "Enabled", false, "halationGroup");
+  defineDouble(paramSet, "scatterAmount", "Scatter Amount", 1.0, 0.0, 2.0, "halationGroup");
+  defineDouble(paramSet, "scatterScale", "Scatter Scale", 1.0, 0.0, 4.0, "halationGroup");
+  defineDouble(paramSet, "halationAmount", "Amount", 1.0, 0.0, 4.0, "halationGroup");
+  defineDouble(paramSet, "halationScale", "Scale", 1.0, 0.0, 4.0, "halationGroup");
+  defineRGB(paramSet, "halationStrength", "Strength RGB", 0.05, 0.015, 0.0, "halationGroup");
+  const char *diffusionFamilies[] = {"Glimmerglass", "Black Pro-Mist", "Pro-Mist", "CineBloom"};
+  defineBool(paramSet, "cameraDiffusionEnabled", "Camera Enabled", false, "diffusionGroup");
+  defineChoice(paramSet, "cameraDiffusionFamily", "Camera Family", diffusionFamilies, 4, 1, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionStrength", "Camera Strength", 0.5, 0.0, 2.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionSpatialScale", "Camera Spatial Scale", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionHaloWarmth", "Camera Halo Warmth", 0.0, -1.5, 1.5, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionCoreIntensity", "Camera Core Intensity", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionCoreSize", "Camera Core Size", 1.0, 0.1, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionHaloIntensity", "Camera Halo Intensity", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionHaloSize", "Camera Halo Size", 1.0, 0.1, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionBloomIntensity", "Camera Bloom Intensity", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "cameraDiffusionBloomSize", "Camera Bloom Size", 1.0, 0.1, 4.0, "diffusionGroup");
+  defineBool(paramSet, "printDiffusionEnabled", "Print Enabled", false, "diffusionGroup");
+  defineChoice(paramSet, "printDiffusionFamily", "Print Family", diffusionFamilies, 4, 1, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionStrength", "Print Strength", 0.5, 0.0, 2.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionSpatialScale", "Print Spatial Scale", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionHaloWarmth", "Print Halo Warmth", 0.0, -1.5, 1.5, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionCoreIntensity", "Print Core Intensity", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionCoreSize", "Print Core Size", 1.0, 0.1, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionHaloIntensity", "Print Halo Intensity", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionHaloSize", "Print Halo Size", 1.0, 0.1, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionBloomIntensity", "Print Bloom Intensity", 1.0, 0.0, 4.0, "diffusionGroup");
+  defineDouble(paramSet, "printDiffusionBloomSize", "Print Bloom Size", 1.0, 0.1, 4.0, "diffusionGroup");
+  defineBool(paramSet, "scannerEnabled", "Enabled", false, "scannerGroup");
+  defineBool(paramSet, "scannerWhiteCorrection", "White Correction", false, "scannerGroup");
+  defineBool(paramSet, "scannerBlackCorrection", "Black Correction", false, "scannerGroup");
+  defineDouble(paramSet, "scannerWhiteLevel", "White Level", 0.98, 0.0, 1.0, "scannerGroup");
+  defineDouble(paramSet, "scannerBlackLevel", "Black Level", 0.01, 0.0, 1.0, "scannerGroup");
+  defineDouble(paramSet, "glarePercent", "Glare Percent", 0.03, 0.0, 0.2, "scannerGroup");
+  defineDouble(paramSet, "scannerMtf50LpMm", "MTF50 lp/mm", 60.0, 0.0, 300.0, "scannerGroup");
+  defineDouble(paramSet, "scannerUnsharpRadiusUm", "Unsharp Radius um", 5.0, 0.0, 100.0, "scannerGroup");
+  defineDouble(paramSet, "scannerUnsharpAmount", "Unsharp Amount", 0.7, 0.0, 4.0, "scannerGroup");
+  defineLabel(paramSet, "infoVersion", "Version:", SPEKTRAFILM_VERSION_STRING, "infoGroup");
+  defineLabel(paramSet, "infoCreatedBy", "Created by:", "Aedan Diez", "infoGroup");
+  defineLabel(paramSet, "infoBasedOn", "Based on work by:", "Andrea Volpato & Johannes Hanika", "infoGroup");
+  const char *lutSizes[] = {"33", "65"};
+  const char *lutDestinations[] = {"User", "DaVinci Resolve", "Nuke", "Adobe Creative", "Final Cut Pro"};
+  defineChoice(paramSet, "lutSize", "LUT Size", lutSizes, 2, 1, "manageGroup");
+  defineChoice(paramSet, "lutDestination", "LUT Destination", lutDestinations, 5, 0, "manageGroup");
+  defineSingleLineString(paramSet, "lutIdentifier", "LUT Identifier", "SpektraFilm", "manageGroup");
+  definePushButton(paramSet, "exportLut", "Export LUT", "manageGroup");
+  definePushButton(paramSet, "copyParams", "Copy Params", "manageGroup");
+  definePushButton(paramSet, "pasteParams", "Paste Params", "manageGroup");
+  definePushButton(paramSet, "saveDefaults", "Set Defaults", "manageGroup");
+  definePushButton(paramSet, "resetDefaults", "Reset Factory Defaults", "manageGroup");
+  definePushButton(paramSet, "openUserManual", "Open User Manual", "manageGroup");
+
+  gDescribeDefaults = nullptr;
+  return kOfxStatOK;
+}
+
+OfxStatus describe(OfxImageEffectHandle effect) {
+  OfxPropertySetHandle props = nullptr;
+  gEffectHost->getPropertySet(effect, &props);
+  gPropHost->propSetString(props, kOfxPropLabel, 0, kPluginLabel);
+  gPropHost->propSetString(props, kOfxPropIcon, 0, svgIconFileForFlavor());
+  gPropHost->propSetString(props, kOfxPropIcon, 1, pngIconFileForFlavor());
+  gPropHost->propSetString(props, kOfxImageEffectPluginPropGrouping, 0, "D3Z Films");
+  gPropHost->propSetString(props, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
+  gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthHalf);
+  gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 1, kOfxBitDepthFloat);
+  gPropHost->propSetString(props, kOfxImageEffectPropColourManagementStyle, 0, kOfxImageEffectColourManagementCore);
+  gPropHost->propSetString(props, kOfxImageEffectPropColourManagementAvailableConfigs, 0, kOfxConfigIdentifier);
+  gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipDepths, 0, 0);
+  gPropHost->propSetInt(props, kOfxImageEffectPropSupportsTiles, 0, 0);
+  gPropHost->propSetInt(props, kOfxImageEffectPropTemporalClipAccess, 0, 0);
+  return kOfxStatOK;
+}
+
+OfxStatus onLoad() {
+  if (!gHost) {
+    return kOfxStatErrMissingHostFeature;
+  }
+  gEffectHost = reinterpret_cast<OfxImageEffectSuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxImageEffectSuite, 1)));
+  gPropHost = reinterpret_cast<OfxPropertySuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxPropertySuite, 1)));
+  gParamHost = reinterpret_cast<OfxParameterSuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxParameterSuite, 1)));
+  gMessageHost = reinterpret_cast<OfxMessageSuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxMessageSuite, 1)));
+  if (!gEffectHost || !gPropHost || !gParamHost) {
+    return kOfxStatErrMissingHostFeature;
+  }
+  return kOfxStatOK;
+}
+
+OfxStatus pluginMain(const char *action, const void *handle, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+  auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void *>(handle));
+  if (std::strcmp(action, kOfxActionLoad) == 0) {
+    return onLoad();
+  }
+  if (std::strcmp(action, kOfxActionDescribe) == 0) {
+    return describe(effect);
+  }
+  if (std::strcmp(action, kOfxImageEffectActionDescribeInContext) == 0) {
+    return describeInContext(effect, inArgs);
+  }
+  if (std::strcmp(action, kOfxActionCreateInstance) == 0) {
+    return createInstance(effect);
+  }
+  if (std::strcmp(action, kOfxActionDestroyInstance) == 0) {
+    return destroyInstance(effect);
+  }
+  if (std::strcmp(action, kOfxActionInstanceChanged) == 0) {
+    return instanceChanged(effect, inArgs);
+  }
+  if (std::strcmp(action, kOfxImageEffectActionGetRegionOfDefinition) == 0) {
+    return getRegionOfDefinition(effect, inArgs, outArgs);
+  }
+  if (std::strcmp(action, kOfxImageEffectActionGetRegionsOfInterest) == 0) {
+    return getRegionOfInterest(effect, inArgs, outArgs);
+  }
+  if (std::strcmp(action, kOfxImageEffectActionRender) == 0) {
+    return render(effect, inArgs, outArgs);
+  }
+  return kOfxStatReplyDefault;
+}
+
+void setHost(OfxHost *host) {
+  gHost = host;
+}
+
+OfxPlugin gPlugin = {
+  kOfxImageEffectPluginApi,
+  1,
+  kPluginIdentifier,
+  kPluginVersionMajor,
+  kPluginVersionMinor,
+  setHost,
+  pluginMain
+};
+
+} // namespace
+
+extern "C" {
+
+SPEKTRA_EXPORT OfxPlugin *OfxGetPlugin(int nth) {
+  return nth == 0 ? &gPlugin : nullptr;
+}
+
+SPEKTRA_EXPORT int OfxGetNumberOfPlugins(void) {
+  return 1;
+}
+
+}
