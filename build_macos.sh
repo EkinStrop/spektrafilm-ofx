@@ -19,11 +19,11 @@ fi
 cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}"
 cmake --build "${BUILD_DIR}" --parallel
 cmake --build "${BUILD_DIR}" \
-  --target SpektraFlowDownloadZip SpektraProDownloadZip \
+  --target spektrafilmDownloadZip spektrafilm_flowDownloadZip \
   --parallel
 
-echo "Built SpektraFlow, SpektraPro, and SpektraFilm OFX bundles in ${BUILD_DIR}"
+echo "Built spektrafilm flow, spektrafilm, and spektrafilm dev OFX bundles in ${BUILD_DIR}"
 echo "Packaged website downloads:"
-echo "  ${REPO_ROOT}/website/public/downloads/SpektraFlow-OFX-macOS.zip"
-echo "  ${REPO_ROOT}/website/public/downloads/SpektraPro-OFX-macOS.zip"
+echo "  ${REPO_ROOT}/website/public/downloads/spektrafilm_flow-OFX-macOS.zip"
+echo "  ${REPO_ROOT}/website/public/downloads/spektrafilm-OFX-macOS.zip"
 echo "Install with: cmake --install ${BUILD_DIR}"

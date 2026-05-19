@@ -37,7 +37,7 @@
 #if defined __APPLE__
 #  define SPEKTRA_EXPORT __attribute__((visibility("default")))
 #else
-#  error SpektraFilm OFX currently builds on macOS only.
+#  error spektrafilm OFX currently builds on macOS only.
 #endif
 
 #ifndef kOfxBitDepthHalf
@@ -49,11 +49,11 @@
 #endif
 
 #ifndef SPEKTRAFILM_PLUGIN_IDENTIFIER
-#  define SPEKTRAFILM_PLUGIN_IDENTIFIER "org.spektrafilm.ofx"
+#  define SPEKTRAFILM_PLUGIN_IDENTIFIER "org.spektrafilm.dev"
 #endif
 
 #ifndef SPEKTRAFILM_PLUGIN_LABEL
-#  define SPEKTRAFILM_PLUGIN_LABEL "SpektraFilm"
+#  define SPEKTRAFILM_PLUGIN_LABEL "spektrafilm dev"
 #endif
 
 #ifndef SPEKTRAFILM_PLUGIN_FLAVOR
@@ -85,25 +85,25 @@ constexpr PluginFlavor kPluginFlavor = static_cast<PluginFlavor>(SPEKTRAFILM_PLU
 constexpr const char *svgIconFileForFlavor() {
   switch (kPluginFlavor) {
     case PluginFlavor::Flow:
-      return "icons/SpektraFlow.svg";
+      return "icons/spektrafilm_flow.svg";
     case PluginFlavor::Pro:
-      return "icons/SpektraPro.svg";
+      return "icons/spektrafilm.svg";
     case PluginFlavor::FilmDev:
-      return "icons/SpektraFilm.svg";
+      return "icons/spektrafilm_dev.svg";
   }
-  return "icons/SpektraFilm.svg";
+  return "icons/spektrafilm_dev.svg";
 }
 
 constexpr const char *pngIconFileForFlavor() {
   switch (kPluginFlavor) {
     case PluginFlavor::Flow:
-      return "icons/SpektraFlow.png";
+      return "icons/spektrafilm_flow.png";
     case PluginFlavor::Pro:
-      return "icons/SpektraPro.png";
+      return "icons/spektrafilm.png";
     case PluginFlavor::FilmDev:
-      return "icons/SpektraFilm.png";
+      return "icons/spektrafilm_dev.png";
   }
-  return "icons/SpektraFilm.png";
+  return "icons/spektrafilm_dev.png";
 }
 
 enum ParamTag : uint32_t {
@@ -1385,14 +1385,14 @@ std::filesystem::path userDefaultsPath() {
 #if defined _WIN32
   const char *base = std::getenv("APPDATA");
   if (base && base[0]) {
-    return std::filesystem::path(base) / "SpektraFilm" / "ofx-defaults-v1.spkdefaults";
+    return std::filesystem::path(base) / "spektrafilm" / "ofx-defaults-v1.spkdefaults";
   }
   const char *home = std::getenv("USERPROFILE");
-  return std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" / "SpektraFilm" / "ofx-defaults-v1.spkdefaults";
+  return std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" / "spektrafilm" / "ofx-defaults-v1.spkdefaults";
 #else
   const char *home = std::getenv("HOME");
   return std::filesystem::path(home && home[0] ? home : ".") /
-    "Library" / "Application Support" / "SpektraFilm" / "ofx-defaults-v1.spkdefaults";
+    "Library" / "Application Support" / "spektrafilm" / "ofx-defaults-v1.spkdefaults";
 #endif
 }
 
@@ -1416,7 +1416,7 @@ bool loadSnapshotFromFile(const std::filesystem::path &path, DefaultsSnapshot &s
   }
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    error = "Could not open Spektra defaults file for reading: " + path.string();
+    error = "Could not open spektrafilm defaults file for reading: " + path.string();
     return false;
   }
   std::string text{
@@ -1424,13 +1424,13 @@ bool loadSnapshotFromFile(const std::filesystem::path &path, DefaultsSnapshot &s
     std::istreambuf_iterator<char>()
   };
   if (!input.good() && !input.eof()) {
-    error = "Could not read Spektra defaults file: " + path.string();
+    error = "Could not read spektrafilm defaults file: " + path.string();
     return false;
   }
   obfuscateDefaultsText(text);
   DefaultsSnapshot decoded;
   if (!decodeDefaultsSnapshot(text, decoded)) {
-    error = "Spektra defaults file is not a recognized defaults snapshot: " + path.string();
+    error = "spektrafilm defaults file is not a recognized defaults snapshot: " + path.string();
     return false;
   }
   snapshot = std::move(decoded);
@@ -1443,7 +1443,7 @@ bool saveSnapshotToFile(const std::filesystem::path &path, const DefaultsSnapsho
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
   if (ec) {
-    error = "Could not create Spektra defaults folder: " + path.parent_path().string();
+    error = "Could not create spektrafilm defaults folder: " + path.parent_path().string();
     return false;
   }
   std::string text = encodeDefaultsSnapshot(snapshot);
@@ -1452,12 +1452,12 @@ bool saveSnapshotToFile(const std::filesystem::path &path, const DefaultsSnapsho
   {
     std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
     if (!output) {
-      error = "Could not open Spektra defaults file for writing: " + tempPath.string();
+      error = "Could not open spektrafilm defaults file for writing: " + tempPath.string();
       return false;
     }
     output.write(text.data(), static_cast<std::streamsize>(text.size()));
     if (!output) {
-      error = "Could not write Spektra defaults file: " + tempPath.string();
+      error = "Could not write spektrafilm defaults file: " + tempPath.string();
       return false;
     }
   }
@@ -1468,7 +1468,7 @@ bool saveSnapshotToFile(const std::filesystem::path &path, const DefaultsSnapsho
     std::filesystem::rename(tempPath, path, ec);
   }
   if (ec) {
-    error = "Could not replace Spektra defaults file: " + path.string();
+    error = "Could not replace spektrafilm defaults file: " + path.string();
     return false;
   }
   return true;
@@ -1479,7 +1479,7 @@ bool deleteSnapshotFile(const std::filesystem::path &path, std::string &error) {
   std::error_code ec;
   std::filesystem::remove(path, ec);
   if (ec) {
-    error = "Could not delete Spektra defaults file: " + path.string();
+    error = "Could not delete spektrafilm defaults file: " + path.string();
     return false;
   }
   return true;
@@ -1525,7 +1525,7 @@ bool writeTextToClipboard(const std::string &text, std::string &error) {
   }
   CFRelease(pasteboard);
   if (status != noErr) {
-    error = clipboardStatusMessage("Could not write Spektra params to system clipboard", status);
+    error = clipboardStatusMessage("Could not write spektrafilm params to system clipboard", status);
     return false;
   }
   return true;
@@ -2035,13 +2035,13 @@ bool copyVisibleParams(OfxParamSetHandle paramSet, OfxTime time, std::string &er
 const char *pluginFlavorName() {
   switch (kPluginFlavor) {
     case PluginFlavor::Flow:
-      return "SpektraFlow";
+      return "spektrafilm flow";
     case PluginFlavor::Pro:
-      return "SpektraPro";
+      return "spektrafilm";
     case PluginFlavor::FilmDev:
-      return "SpektraFilm";
+      return "spektrafilm dev";
   }
-  return "SpektraFilm";
+  return "spektrafilm dev";
 }
 
 const char *processName(spektrafilm::ProcessMode process) {
@@ -2174,9 +2174,9 @@ std::filesystem::path homeFolder() {
 
 std::filesystem::path userLutFolder() {
 #if defined _WIN32
-  return homeFolder() / "Documents" / "SpektraFilm";
+  return homeFolder() / "Documents" / "spektrafilm";
 #else
-  return homeFolder() / "Movies" / "SpektraFilm";
+  return homeFolder() / "Movies" / "spektrafilm";
 #endif
 }
 
@@ -2186,27 +2186,27 @@ std::filesystem::path lutDestinationFolder(int destination) {
     case 1:
 #if defined _WIN32
       return envPath("PROGRAMDATA", "C:\\ProgramData") /
-        "Blackmagic Design" / "DaVinci Resolve" / "Support" / "LUT" / "SpektraFilm";
+        "Blackmagic Design" / "DaVinci Resolve" / "Support" / "LUT" / "spektrafilm";
 #else
       return std::filesystem::path("/") / "Library" / "Application Support" /
-        "Blackmagic Design" / "DaVinci Resolve" / "LUT" / "SpektraFilm";
+        "Blackmagic Design" / "DaVinci Resolve" / "LUT" / "spektrafilm";
 #endif
     case 2:
-      return homePath / ".nuke" / "SpektraFilm";
+      return homePath / ".nuke" / "spektrafilm";
     case 3:
 #if defined _WIN32
       return envPath("PROGRAMFILES", "C:\\Program Files") /
-        "Adobe" / "Common" / "LUTs" / "Creative" / "SpektraFilm";
+        "Adobe" / "Common" / "LUTs" / "Creative" / "spektrafilm";
 #else
       return std::filesystem::path("/") / "Library" / "Application Support" /
-        "Adobe" / "Common" / "LUTs" / "Creative" / "SpektraFilm";
+        "Adobe" / "Common" / "LUTs" / "Creative" / "spektrafilm";
 #endif
     case 4:
 #if defined _WIN32
       return userLutFolder();
 #else
       return homePath / "Library" / "Application Support" /
-        "ProApps" / "Custom LUTs" / "SpektraFilm";
+        "ProApps" / "Custom LUTs" / "spektrafilm";
 #endif
     case 0:
     default:
@@ -2216,7 +2216,7 @@ std::filesystem::path lutDestinationFolder(int destination) {
 
 std::filesystem::path generatedLutExportPath(int destination, const std::string &identifier) {
   const std::filesystem::path folder = lutDestinationFolder(destination);
-  const std::string cleanIdentifier = sanitizePathComponent(identifier.empty() ? "SpektraFilm" : identifier);
+  const std::string cleanIdentifier = sanitizePathComponent(identifier.empty() ? "spektrafilm" : identifier);
   const std::string date = currentDatePrefix();
   for (int attempt = 0; attempt < 64; ++attempt) {
     std::filesystem::path path = folder / (date + "_" + cleanIdentifier + "_" + randomExportCode() + ".cube");
@@ -2238,13 +2238,13 @@ std::filesystem::path bundledUserManualPath() {
   if (contentsPath.empty()) {
     return {};
   }
-  return contentsPath / "Resources" / "SpektraFilm_User_Manual.pdf";
+  return contentsPath / "Resources" / "spektrafilm_user_manual.pdf";
 }
 
 bool openBundledUserManual(std::string &error) {
   const std::filesystem::path manualPath = bundledUserManualPath();
   if (manualPath.empty() || !std::filesystem::is_regular_file(manualPath)) {
-    error = "Could not find SpektraFilm_User_Manual.pdf in the OFX bundle resources.";
+    error = "Could not find spektrafilm_user_manual.pdf in the OFX bundle resources.";
     return false;
   }
 
@@ -2256,14 +2256,14 @@ bool openBundledUserManual(std::string &error) {
     false
   );
   if (!manualUrl) {
-    error = "Could not create a file URL for the SpektraFilm user manual.";
+    error = "Could not create a file URL for the spektrafilm user manual.";
     return false;
   }
 
   const OSStatus status = LSOpenCFURLRef(manualUrl, nullptr);
   CFRelease(manualUrl);
   if (status != noErr) {
-    error = "Could not open the SpektraFilm user manual. LaunchServices returned " + std::to_string(status) + ".";
+    error = "Could not open the spektrafilm user manual. LaunchServices returned " + std::to_string(status) + ".";
     return false;
   }
   return true;
@@ -2692,7 +2692,7 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
       if (copyVisibleParams(paramSet, time, error)) {
         return kOfxStatOK;
       }
-      showMessage(effect, kOfxMessageError, "SpektraFilmDefaults", error.empty() ? "Could not copy Spektra params." : error);
+      showMessage(effect, kOfxMessageError, "spektrafilmDefaults", error.empty() ? "Could not copy spektrafilm params." : error);
       return kOfxStatFailed;
     }
     if (pasteParamsChanged) {
@@ -2701,19 +2701,19 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
       std::string error;
       std::string clipboardText;
       if (!readTextFromClipboard(clipboardText, copyFound, error)) {
-        showMessage(effect, kOfxMessageError, "SpektraFilmDefaults", error.empty() ? "Could not read copied Spektra params." : error);
+        showMessage(effect, kOfxMessageError, "spektrafilmDefaults", error.empty() ? "Could not read copied spektrafilm params." : error);
         return kOfxStatFailed;
       }
       if (!copyFound) {
-        showMessage(effect, kOfxMessageWarning, "SpektraFilmDefaults", "No copied Spektra params found.");
+        showMessage(effect, kOfxMessageWarning, "spektrafilmDefaults", "No copied spektrafilm params found.");
         return kOfxStatReplyDefault;
       }
       obfuscateDefaultsText(clipboardText);
       if (!decodeDefaultsSnapshot(clipboardText, copiedParams)) {
-        showMessage(effect, kOfxMessageWarning, "SpektraFilmDefaults", "Clipboard does not contain Spektra params.");
+        showMessage(effect, kOfxMessageWarning, "spektrafilmDefaults", "Clipboard does not contain spektrafilm params.");
         return kOfxStatReplyDefault;
       }
-      gParamHost->paramEditBegin(paramSet, "Paste Spektra Params");
+      gParamHost->paramEditBegin(paramSet, "Paste spektrafilm params");
       applySnapshotToParamSet(paramSet, copiedParams);
       gParamHost->paramEditEnd(paramSet);
       syncConditionalParamVisibility(data);
@@ -2722,10 +2722,10 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
     if (saveDefaultsChanged) {
       std::string error;
       if (saveVisibleDefaults(paramSet, time, error)) {
-        showMessage(effect, kOfxMessageMessage, "SpektraFilmDefaults", "Spektra defaults saved successfully.");
+        showMessage(effect, kOfxMessageMessage, "spektrafilmDefaults", "spektrafilm defaults saved successfully.");
         return kOfxStatOK;
       }
-      showMessage(effect, kOfxMessageError, "SpektraFilmDefaults", error.empty() ? "Could not save Spektra defaults." : error);
+      showMessage(effect, kOfxMessageError, "spektrafilmDefaults", error.empty() ? "Could not save spektrafilm defaults." : error);
       return kOfxStatFailed;
     }
     if (exportLutChanged) {
@@ -2733,15 +2733,15 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
       std::vector<std::string> disabledEffects;
       std::string error;
       if (!exportCurrentLut(data, time, path, disabledEffects, error)) {
-        showMessage(effect, kOfxMessageError, "SpektraFilmLutExport", error.empty() ? "Could not export Spektra LUT." : error);
+        showMessage(effect, kOfxMessageError, "spektrafilmLutExport", error.empty() ? "Could not export spektrafilm LUT." : error);
         return kOfxStatFailed;
       }
-      std::string message = "Spektra LUT exported: " + path.string();
+      std::string message = "spektrafilm LUT exported: " + path.string();
       if (!disabledEffects.empty()) {
         message += "\n\nThis LUT contains the color-only spectral transform. Disabled for export: " + joinLabels(disabledEffects) + ".";
-        showMessage(effect, kOfxMessageWarning, "SpektraFilmLutExport", message);
+        showMessage(effect, kOfxMessageWarning, "spektrafilmLutExport", message);
       } else {
-        showMessage(effect, kOfxMessageMessage, "SpektraFilmLutExport", message);
+        showMessage(effect, kOfxMessageMessage, "spektrafilmLutExport", message);
       }
       return kOfxStatOK;
     }
@@ -2750,7 +2750,7 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
       if (openBundledUserManual(error)) {
         return kOfxStatOK;
       }
-      showMessage(effect, kOfxMessageError, "SpektraFilmUserManual", error.empty() ? "Could not open the SpektraFilm user manual." : error);
+      showMessage(effect, kOfxMessageError, "spektrafilmUserManual", error.empty() ? "Could not open the spektrafilm user manual." : error);
       return kOfxStatFailed;
     }
     std::string error;
@@ -2758,19 +2758,19 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
       showMessage(
         effect,
         kOfxMessageError,
-        "SpektraFilmDefaults",
-        error.empty() ? "Could not delete Spektra defaults file." : error
+        "spektrafilmDefaults",
+        error.empty() ? "Could not delete spektrafilm defaults file." : error
       );
       return kOfxStatFailed;
     }
-    gParamHost->paramEditBegin(paramSet, "Reset Spektra Factory Defaults");
+    gParamHost->paramEditBegin(paramSet, "Reset spektrafilm factory defaults");
     resetParamSetToFactory(paramSet);
     if (dirUsesStockCalibration(data)) {
       applyDirStockCalibration(data, false);
     }
     gParamHost->paramEditEnd(paramSet);
     syncConditionalParamVisibility(data);
-    showMessage(effect, kOfxMessageMessage, "SpektraFilmDefaults", "Spektra factory defaults restored.");
+    showMessage(effect, kOfxMessageMessage, "spektrafilmDefaults", "spektrafilm factory defaults restored.");
     return kOfxStatOK;
   }
 
@@ -3323,7 +3323,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPr
     spektrafilm::RenderParams params = readParams(data, time);
     if (!data->renderer->render(source, output, window, params, time)) {
       if (gMessageHost) {
-        gMessageHost->message(effect, kOfxMessageError, "SpektraFilmMetal", "%s", data->renderer->lastError().c_str());
+        gMessageHost->message(effect, kOfxMessageError, "spektrafilmMetal", "%s", data->renderer->lastError().c_str());
       }
       status = kOfxStatFailed;
     }
@@ -3592,7 +3592,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   const char *lutDestinations[] = {"User", "DaVinci Resolve", "Nuke", "Adobe Creative", "Final Cut Pro"};
   defineChoice(paramSet, "lutSize", "LUT Size", lutSizes, 2, 1, "manageGroup");
   defineChoice(paramSet, "lutDestination", "LUT Destination", lutDestinations, 5, 0, "manageGroup");
-  defineSingleLineString(paramSet, "lutIdentifier", "LUT Identifier", "SpektraFilm", "manageGroup");
+  defineSingleLineString(paramSet, "lutIdentifier", "LUT Identifier", "spektrafilm", "manageGroup");
   definePushButton(paramSet, "exportLut", "Export LUT", "manageGroup");
   definePushButton(paramSet, "copyParams", "Copy Params", "manageGroup");
   definePushButton(paramSet, "pasteParams", "Paste Params", "manageGroup");
@@ -3610,7 +3610,7 @@ OfxStatus describe(OfxImageEffectHandle effect) {
   gPropHost->propSetString(props, kOfxPropLabel, 0, kPluginLabel);
   gPropHost->propSetString(props, kOfxPropIcon, 0, svgIconFileForFlavor());
   gPropHost->propSetString(props, kOfxPropIcon, 1, pngIconFileForFlavor());
-  gPropHost->propSetString(props, kOfxImageEffectPluginPropGrouping, 0, "D3Z Films");
+  gPropHost->propSetString(props, kOfxImageEffectPluginPropGrouping, 0, "spektrafilm OFX");
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthHalf);
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 1, kOfxBitDepthFloat);

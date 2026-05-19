@@ -1,0 +1,16 @@
+spektrafilm OFX installation
+============================
+
+To install the plugin, copy the .ofx.bundle folder from this ZIP into:
+
+  /Library/OFX/Plugins/
+
+For example:
+
+  /Library/OFX/Plugins/spektrafilm_flow.ofx.bundle
+  /Library/OFX/Plugins/spektrafilm.ofx.bundle
+
+You may need administrator permission to copy files into /Library/OFX/Plugins/.
+
+After copying the bundle, restart your OFX host application so it rescans the
+plugin folder.

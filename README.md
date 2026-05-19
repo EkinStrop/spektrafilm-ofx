@@ -1,6 +1,6 @@
-# SpektraFilm OFX
+# spektrafilm OFX
 
-Spektra OFX is a native macOS OpenFX plugin project built from the
+spektrafilm OFX is a native macOS OpenFX plugin project built from the
 `spektrafilm` film-simulation codebase. It is intended for host applications
 such as DaVinci Resolve and provides Metal-accelerated film, print, scan, grain,
 halation, diffusion, color-management, and LUT-export workflows inside an OFX
@@ -35,9 +35,9 @@ The naming is intentionally split between the underlying framework and the built
 | Name | Meaning |
 | --- | --- |
 | `spektrafilm` | The code framework and reference film-simulation project by Andrea Volpato. |
-| `SpektraFlow` | A streamlined OFX plugin flavor focused on the main creative controls and a simpler grading workflow. Intended for beginner users. |
-| `SpektraPro` | A fuller OFX plugin flavor with more professional controls exposed while still hiding unstable/in-development tools . |
-| `SpektraFilm` | The development/reference OFX flavor used for research and development, verification, and tuning internal controls. It is built locally, but it is not packaged by the normal public download target. |
+| `spektrafilm flow` | A streamlined OFX plugin flavor focused on the main creative controls and a simpler grading workflow. Intended for beginner users. |
+| `spektrafilm` | A fuller OFX plugin flavor with more professional controls exposed while still hiding unstable/in-development tools. |
+| `spektrafilm dev` | The development/reference OFX flavor used for research and development, verification, and tuning internal controls. It is built locally, but it is not packaged by the normal public download target. |
 
 ## Binary Downloads and Product Page
 
@@ -129,13 +129,13 @@ printer-light controls become available in the relevant plugin flavors.
 ### Bleach Bypass Controls (Experimental)
 
 The native renderer has experimental negative and print bleach-bypass controls
-available in the SpektraFilm dev build. They are an attempt to model retained silver in the
+available in the `spektrafilm dev` build. They are an attempt to model retained silver in the
 film or print path, but this area is not yet backed by enough stock- and/or
 process-specific measured data.
 
 For that reason, these controls should not be treated as representative lab
 controls but as a playful first attempt at modeling this process. They are not exposed 
-in the normal public `SpektraFlow` and `SpektraPro` builds.
+in the normal public `spektrafilm flow` and `spektrafilm` builds.
 
 ## Project Layout
 
@@ -212,7 +212,7 @@ cd OFX/SpektraFilm
 ```
 
 The script configures CMake, builds the plugin targets, and produces ZIP
-packages for `SpektraFlow` and `SpektraPro`.
+packages for `spektrafilm flow` and `spektrafilm`.
 
 ## Manual CMake Build
 
@@ -227,7 +227,7 @@ cmake --build build --parallel
 To package the download ZIPs:
 
 ```sh
-cmake --build build --target SpektraFlowDownloadZip SpektraProDownloadZip --parallel
+cmake --build build --target spektrafilmDownloadZip spektrafilm_flowDownloadZip --parallel
 ```
 
 To install the built OFX bundles into the system OFX plugin directory:
@@ -255,12 +255,12 @@ OFX/SpektraFilm/build/
 The ZIP targets write:
 
 ```text
-website/public/downloads/SpektraFlow-OFX-macOS.zip
-website/public/downloads/SpektraPro-OFX-macOS.zip
+website/public/downloads/spektrafilm_flow-OFX-macOS.zip
+website/public/downloads/spektrafilm-OFX-macOS.zip
 ```
 
-The `SpektraFilm` development flavor is built as a local target, but the default
-download packaging script does not create a `SpektraFilm` ZIP by default as it is not intended for distribution but internal validation only.
+The `spektrafilm dev` development flavor is built as a local target, but the default
+download packaging script does not create a `spektrafilm_dev` ZIP by default as it is not intended for distribution but internal validation only.
 
 ## Resource Generation
 
@@ -282,11 +282,11 @@ Generated resources include:
 
 The build defines three OFX bundle targets:
 
-| Target | Bundle label | Plugin identifier | Public package |
-| --- | --- | --- | --- |
-| `SpektraFlow` | `SpektraFlow` | `org.spektrafilm.flow` | Yes |
-| `SpektraPro` | `SpektraPro` | `org.spektrafilm.pro` | Yes |
-| `SpektraFilm` | `SpektraFilm` | `org.spektrafilm.ofx` | No |
+| Target | Artifact name | Bundle label | Plugin identifier | Public package |
+| --- | --- | --- | --- | --- |
+| `spektrafilm_flow` | `spektrafilm_flow` | `spektrafilm flow` | `org.spektrafilm.flow` | Yes |
+| `spektrafilm` | `spektrafilm` | `spektrafilm` | `org.spektrafilm` | Yes |
+| `spektrafilm_dev` | `spektrafilm_dev` | `spektrafilm dev` | `org.spektrafilm.dev` | No |
 
 All three are compiled from the same source. Flavor-specific behavior is
 controlled through compile definitions and parameter visibility rules in
@@ -308,8 +308,8 @@ binary distribution notices. See:
 
 ```text
 LICENSE.txt
-Legal/SPEKTRA_OFX_LICENSE.txt
-Legal/SPEKTRA_OFX_LUT_LICENSE.txt
+Legal/SPEKTRAFILM_OFX_LICENSE.txt
+Legal/SPEKTRAFILM_OFX_LUT_LICENSE.txt
 Legal/THIRD_PARTY_NOTICES.txt
 ```
 
@@ -320,7 +320,7 @@ Important practical points:
 2. Official binary distributions may include bundled resources covered by the
    notices in `Legal/`.
 3. LUT files exported from the plugin are governed by
-   `Legal/SPEKTRA_OFX_LUT_LICENSE.txt`.
+   `Legal/SPEKTRAFILM_OFX_LUT_LICENSE.txt`.
 4. The vendored OpenFX SDK carries its own notices under `third_party/openfx/`.
 
 ## Development Notes

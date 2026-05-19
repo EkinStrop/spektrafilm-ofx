@@ -1,7 +1,7 @@
-Spektra OFX Third-Party Notices
+spektrafilm OFX Third-Party Notices
 
-This file accompanies the native OFX plugin distributions of SpektraFlow,
-SpektraPro, and SpektraFilm.
+This file accompanies the native OFX plugin distributions of spektrafilm,
+spektrafilm flow, and spektrafilm dev.
 
 
 Andrea Volpato spektrafilm

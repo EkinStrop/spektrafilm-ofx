@@ -31,11 +31,18 @@ namespace {
 int bundleImageAnchor = 0;
 
 NSURL *findBundleResourceURL(NSString *name, NSString *extension) {
-  NSBundle *pluginBundle = [NSBundle bundleWithIdentifier:@"org.spektrafilm.ofx"];
-  if (pluginBundle) {
-    NSURL *url = [pluginBundle URLForResource:name withExtension:extension];
-    if (url) {
-      return url;
+  NSArray<NSString *> *bundleIdentifiers = @[
+    @"org.spektrafilm",
+    @"org.spektrafilm.flow",
+    @"org.spektrafilm.dev"
+  ];
+  for (NSString *bundleIdentifier in bundleIdentifiers) {
+    NSBundle *pluginBundle = [NSBundle bundleWithIdentifier:bundleIdentifier];
+    if (pluginBundle) {
+      NSURL *url = [pluginBundle URLForResource:name withExtension:extension];
+      if (url) {
+        return url;
+      }
     }
   }
   for (NSBundle *candidate in [NSBundle allBundles]) {

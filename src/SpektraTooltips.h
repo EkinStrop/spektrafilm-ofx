@@ -149,14 +149,14 @@ inline constexpr TooltipEntry kTooltipEntries[] = {
   {"scannerUnsharpRadiusUm", "Film-plane radius for scanner unsharp masking, in micrometers."},
   {"scannerUnsharpAmount", "Strength of scanner unsharp masking."},
   {"lutSize", "3D LUT cube resolution. 65 is higher quality; 33 exports faster and creates a smaller file."},
-  {"lutDestination", "Folder preset for exported .cube LUTs. User writes to the SpektraFilm folder in Movies."},
+  {"lutDestination", "Folder preset for exported .cube LUTs. User writes to the spektrafilm folder in Movies."},
   {"lutIdentifier", "Custom filename segment placed between the date prefix and random export code."},
   {"exportLut", "Exports a Display Out SDR color-only .cube LUT. Scene Handoff (Dev) and Display Out HDR disable this action."},
   {"copyParams", "Copies the current settings to the system clipboard without changing startup defaults."},
   {"pasteParams", "Applies copied Spektra settings from the system clipboard to matching controls in this plugin instance."},
   {"saveDefaults", "Stores the current settings as obfuscated defaults for new Spektra instances."},
   {"resetDefaults", "Deletes saved user defaults and resets the current controls to factory values."},
-  {"openUserManual", "Opens the bundled SpektraFilm user manual PDF."},
+  {"openUserManual", "Opens the bundled spektrafilm user manual PDF."},
 };
 
 inline const char *tooltipForParam(const char *name) {

@@ -113,18 +113,19 @@ add_custom_target(SpektraFilmMetalLibrary ALL DEPENDS "${SPEKTRAFILM_METALLIB}")
 
 set(SPEKTRAFILM_WEBSITE_DOWNLOAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../website/public/downloads")
 set(SPEKTRAFILM_USER_MANUAL_PDF "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/user_manual/main.pdf")
-set(SPEKTRA_OFX_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/Legal/SPEKTRA_OFX_LICENSE.txt")
-set(SPEKTRA_OFX_LUT_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/Legal/SPEKTRA_OFX_LUT_LICENSE.txt")
-set(SPEKTRA_OFX_THIRD_PARTY_NOTICES "${CMAKE_CURRENT_SOURCE_DIR}/Legal/THIRD_PARTY_NOTICES.txt")
+set(SPEKTRAFILM_OFX_INSTALL_INSTRUCTIONS "${CMAKE_CURRENT_SOURCE_DIR}/install_instructions.txt")
+set(SPEKTRAFILM_OFX_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/Legal/SPEKTRAFILM_OFX_LICENSE.txt")
+set(SPEKTRAFILM_OFX_LUT_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/Legal/SPEKTRAFILM_OFX_LUT_LICENSE.txt")
+set(SPEKTRAFILM_OFX_THIRD_PARTY_NOTICES "${CMAKE_CURRENT_SOURCE_DIR}/Legal/THIRD_PARTY_NOTICES.txt")
 
-function(add_spektra_ofx_plugin target label plugin_id flavor package_for_website)
-  set(SPEKTRAFILM_BUNDLE_EXECUTABLE "${label}.ofx")
+function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flavor package_for_website)
+  set(SPEKTRAFILM_BUNDLE_EXECUTABLE "${artifact_name}.ofx")
   set(SPEKTRAFILM_BUNDLE_IDENTIFIER "${plugin_id}")
-  set(SPEKTRAFILM_BUNDLE_NAME "${label}")
-  set(SPEKTRAFILM_PLUGIN_ICON_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/${label}.png")
+  set(SPEKTRAFILM_BUNDLE_NAME "${display_name}")
+  set(SPEKTRAFILM_PLUGIN_ICON_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/${artifact_name}.png")
   set(SPEKTRAFILM_RESOLVE_ICON_NAME "${plugin_id}.png")
   set(SPEKTRAFILM_MANIFEST_ID "${plugin_id}")
-  set(SPEKTRAFILM_MANIFEST_NAME "${label}")
+  set(SPEKTRAFILM_MANIFEST_NAME "${display_name}")
   set(SPEKTRAFILM_MANIFEST_VERSION "${SPEKTRAFILM_VERSION}")
 
   set(info_plist "${CMAKE_CURRENT_BINARY_DIR}/${target}-Info.plist")
@@ -146,7 +147,7 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
   target_compile_definitions(${target} PRIVATE
     SPEKTRAFILM_VERSION_STRING="${SPEKTRAFILM_VERSION}"
     SPEKTRAFILM_PLUGIN_IDENTIFIER="${plugin_id}"
-    SPEKTRAFILM_PLUGIN_LABEL="${label}"
+    SPEKTRAFILM_PLUGIN_LABEL="${display_name}"
     SPEKTRAFILM_PLUGIN_FLAVOR=${flavor}
   )
 
@@ -166,7 +167,7 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
     BUNDLE TRUE
     BUNDLE_EXTENSION "ofx.bundle"
     MACOSX_BUNDLE_INFO_PLIST "${info_plist}"
-    OUTPUT_NAME "${label}"
+    OUTPUT_NAME "${artifact_name}"
     PREFIX ""
   )
 
@@ -175,24 +176,36 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
     "${plugin_manifest}"
     "${SPEKTRAFILM_GENERATED_HANATOS_LUT}"
     "${SPEKTRAFILM_USER_MANUAL_PDF}"
-    "${SPEKTRA_OFX_LICENSE}"
-    "${SPEKTRA_OFX_LUT_LICENSE}"
-    "${SPEKTRA_OFX_THIRD_PARTY_NOTICES}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFlow.svg"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraPro.svg"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFilm.svg"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFlow.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraPro.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFilm.png"
+    "${SPEKTRAFILM_OFX_LICENSE}"
+    "${SPEKTRAFILM_OFX_LUT_LICENSE}"
+    "${SPEKTRAFILM_OFX_THIRD_PARTY_NOTICES}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_flow.svg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm.svg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_dev.svg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_flow.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_dev.png"
     "${SPEKTRAFILM_PLUGIN_ICON_SOURCE}"
   )
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons"
+    COMMAND "${CMAKE_COMMAND}" -E rm -f
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm_User_Manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.ofx.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.pro.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LICENSE.txt"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LUT_LICENSE.txt"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "$<TARGET_FILE:${target}>"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/MacOS/${label}.ofx"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/MacOS/${artifact_name}.ofx"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_METALLIB}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm.metallib"
@@ -204,34 +217,34 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraHanatos2025Spectra.f32"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_USER_MANUAL_PDF}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm_User_Manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/spektrafilm_user_manual.pdf"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SPEKTRA_OFX_LICENSE}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LICENSE.txt"
+            "${SPEKTRAFILM_OFX_LICENSE}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRAFILM_OFX_LICENSE.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SPEKTRA_OFX_LUT_LICENSE}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LUT_LICENSE.txt"
+            "${SPEKTRAFILM_OFX_LUT_LICENSE}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRAFILM_OFX_LUT_LICENSE.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SPEKTRA_OFX_THIRD_PARTY_NOTICES}"
+            "${SPEKTRAFILM_OFX_THIRD_PARTY_NOTICES}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/THIRD_PARTY_NOTICES.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFlow.svg"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.svg"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_flow.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_flow.svg"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraPro.svg"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.svg"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm.svg"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFilm.svg"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.svg"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_dev.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_dev.svg"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFlow.png"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.png"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_flow.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_flow.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraPro.png"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.png"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFilm.png"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.png"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_dev.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_dev.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_PLUGIN_ICON_SOURCE}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/${SPEKTRAFILM_RESOLVE_ICON_NAME}"
@@ -241,9 +254,21 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons"
+    COMMAND "${CMAKE_COMMAND}" -E rm -f
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm_User_Manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.ofx.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.pro.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LICENSE.txt"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LUT_LICENSE.txt"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "$<TARGET_FILE:${target}>"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/MacOS/${label}.ofx"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/MacOS/${artifact_name}.ofx"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_METALLIB}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm.metallib"
@@ -255,34 +280,34 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraHanatos2025Spectra.f32"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_USER_MANUAL_PDF}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm_User_Manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/spektrafilm_user_manual.pdf"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SPEKTRA_OFX_LICENSE}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LICENSE.txt"
+            "${SPEKTRAFILM_OFX_LICENSE}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRAFILM_OFX_LICENSE.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SPEKTRA_OFX_LUT_LICENSE}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LUT_LICENSE.txt"
+            "${SPEKTRAFILM_OFX_LUT_LICENSE}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRAFILM_OFX_LUT_LICENSE.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SPEKTRA_OFX_THIRD_PARTY_NOTICES}"
+            "${SPEKTRAFILM_OFX_THIRD_PARTY_NOTICES}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/THIRD_PARTY_NOTICES.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFlow.svg"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.svg"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_flow.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_flow.svg"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraPro.svg"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.svg"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm.svg"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFilm.svg"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.svg"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_dev.svg"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_dev.svg"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFlow.png"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFlow.png"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_flow.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_flow.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraPro.png"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraPro.png"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/SpektraFilm.png"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/SpektraFilm.png"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/spektrafilm_dev.png"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons/spektrafilm_dev.png"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_PLUGIN_ICON_SOURCE}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/${SPEKTRAFILM_RESOLVE_ICON_NAME}"
@@ -293,7 +318,7 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
   add_dependencies(${target} SpektraFilmMetalLibrary)
 
   if(package_for_website)
-    set(download_zip "${SPEKTRAFILM_WEBSITE_DOWNLOAD_DIR}/${label}-OFX-macOS.zip")
+    set(download_zip "${SPEKTRAFILM_WEBSITE_DOWNLOAD_DIR}/${artifact_name}-OFX-macOS.zip")
     set(download_stage "${CMAKE_CURRENT_BINARY_DIR}/${target}-download")
     add_custom_target(${target}DownloadZip
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${SPEKTRAFILM_WEBSITE_DOWNLOAD_DIR}"
@@ -302,15 +327,18 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${download_stage}"
       COMMAND "${CMAKE_COMMAND}" -E copy_directory
               "$<TARGET_BUNDLE_DIR:${target}>"
-              "${download_stage}/${label}.ofx.bundle"
+              "${download_stage}/${artifact_name}.ofx.bundle"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-              "${SPEKTRA_OFX_LICENSE}"
-              "${download_stage}/SPEKTRA_OFX_LICENSE.txt"
+              "${SPEKTRAFILM_OFX_INSTALL_INSTRUCTIONS}"
+              "${download_stage}/install_instructions.txt"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-              "${SPEKTRA_OFX_LUT_LICENSE}"
-              "${download_stage}/SPEKTRA_OFX_LUT_LICENSE.txt"
+              "${SPEKTRAFILM_OFX_LICENSE}"
+              "${download_stage}/SPEKTRAFILM_OFX_LICENSE.txt"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-              "${SPEKTRA_OFX_THIRD_PARTY_NOTICES}"
+              "${SPEKTRAFILM_OFX_LUT_LICENSE}"
+              "${download_stage}/SPEKTRAFILM_OFX_LUT_LICENSE.txt"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+              "${SPEKTRAFILM_OFX_THIRD_PARTY_NOTICES}"
               "${download_stage}/THIRD_PARTY_NOTICES.txt"
       COMMAND "${CMAKE_COMMAND}" -E env COPYFILE_DISABLE=1 /usr/bin/ditto
               -c
@@ -318,7 +346,7 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
               --norsrc
               "${download_stage}"
               "${download_zip}"
-      DEPENDS ${target}BundleResources
+      DEPENDS ${target}BundleResources "${SPEKTRAFILM_OFX_INSTALL_INSTRUCTIONS}"
       VERBATIM
     )
   endif()
@@ -329,9 +357,9 @@ function(add_spektra_ofx_plugin target label plugin_id flavor package_for_websit
   )
 endfunction()
 
-add_spektra_ofx_plugin(SpektraFlow SpektraFlow org.spektrafilm.flow 0 TRUE)
-add_spektra_ofx_plugin(SpektraPro SpektraPro org.spektrafilm.pro 1 TRUE)
-add_spektra_ofx_plugin(SpektraFilm SpektraFilm org.spektrafilm.ofx 2 FALSE)
+add_spektra_ofx_plugin(spektrafilm_flow spektrafilm_flow "spektrafilm flow" org.spektrafilm.flow 0 TRUE)
+add_spektra_ofx_plugin(spektrafilm spektrafilm spektrafilm org.spektrafilm 1 TRUE)
+add_spektra_ofx_plugin(spektrafilm_dev spektrafilm_dev "spektrafilm dev" org.spektrafilm.dev 2 FALSE)
 
 add_executable(SpektraFilmPerfHarness
   tools/SpektraMetalPerfHarness.mm
