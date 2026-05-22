@@ -187,6 +187,8 @@ inline constexpr ParamMetadata kParamMetadata[] = {
 
   {"dirAmount", "couplerGroup", flow()},
   {"dirDiffusionUm", "couplerGroup", flow()},
+  {"dirDiffusionTailUm", "couplerGroup", kParamTagNone},
+  {"dirDiffusionTailWeight", "couplerGroup", kParamTagNone},
   {"dirInhibitionSameLayer", "couplerGroup", flow()},
   {"dirInhibitionInterlayer", "couplerGroup", flow()},
   {"dirGammaSameLayerRgb", "couplerGroup", kParamTagNone},
@@ -447,12 +449,14 @@ inline constexpr ParamDefault kParamDefaults[] = {
 
   doubleDefault("dirAmount", 0.0),
   doubleDefault("dirDiffusionUm", 20.0),
+  doubleDefault("dirDiffusionTailUm", 200.0),
+  doubleDefault("dirDiffusionTailWeight", 0.06),
   doubleDefault("dirInhibitionSameLayer", 1.0),
   doubleDefault("dirInhibitionInterlayer", 1.0),
-  double3DDefault("dirGammaSameLayerRgb", 0.336, 0.319, 0.273),
-  double2DDefault("dirGammaRToGb", 0.353, 0.302),
-  double2DDefault("dirGammaGToRb", 0.154, 0.353),
-  double2DDefault("dirGammaBToRg", 0.168, 0.226),
+  double3DDefault("dirGammaSameLayerRgb", 0.341, 0.324, 0.273),
+  double2DDefault("dirGammaRToGb", 0.355, 0.305),
+  double2DDefault("dirGammaGToRb", 0.154, 0.358),
+  double2DDefault("dirGammaBToRg", 0.171, 0.225),
   boolDefault("dirUsesStockCalibration", true),
 
   boolDefault("grainEnabled", false),
@@ -652,6 +656,8 @@ struct InstanceData {
   OfxParamHandle printerLightCalibration = nullptr;
   OfxParamHandle dirAmount = nullptr;
   OfxParamHandle dirDiffusionUm = nullptr;
+  OfxParamHandle dirDiffusionTailUm = nullptr;
+  OfxParamHandle dirDiffusionTailWeight = nullptr;
   OfxParamHandle dirInhibitionSameLayer = nullptr;
   OfxParamHandle dirInhibitionInterlayer = nullptr;
   OfxParamHandle dirGammaSameLayerRgb = nullptr;
@@ -1049,6 +1055,18 @@ HdrPresetValues hdrPresetValues(int preset) {
   }
 }
 
+spektrafilm::RgbToRawMethod rgbToRawMethodFromChoice(int choice) {
+  switch (choice) {
+    case 1:
+      return spektrafilm::RgbToRawMethod::Hanatos2025;
+    case 2:
+      return spektrafilm::RgbToRawMethod::Mallett2019;
+    case 0:
+    default:
+      return spektrafilm::RgbToRawMethod::Hanatos2026;
+  }
+}
+
 spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   constexpr spektrafilm::ColorSpace kSdrOutputColorSpaces[] = {
     spektrafilm::ColorSpace::Srgb,
@@ -1083,7 +1101,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.process = getIntAtTime(data->process, time, 0) == 1
     ? spektrafilm::ProcessMode::ScanNegative
     : spektrafilm::ProcessMode::PrintSimulation;
-  params.rgbToRawMethod = static_cast<spektrafilm::RgbToRawMethod>(getIntAtTime(data->rgbToRawMethod, time, 0));
+  params.rgbToRawMethod = rgbToRawMethodFromChoice(getIntAtTime(data->rgbToRawMethod, time, 0));
   params.inputColorSpace = static_cast<spektrafilm::ColorSpace>(getIntAtTime(data->inputColorSpace, time, 0));
   params.outputRole = outputRoleForFlavor(getIntAtTime(data->outputRole, time, 0));
   if (params.outputRole == spektrafilm::OutputRole::SceneHandoff) {
@@ -1147,9 +1165,11 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.printerLightCalibration = getBoolAtTime(data->printerLightCalibration, time, true);
   params.dirCouplersAmount = static_cast<float>(getDoubleAtTime(data->dirAmount, time, 0.0));
   params.dirCouplersDiffusionUm = static_cast<float>(getDoubleAtTime(data->dirDiffusionUm, time, 20.0));
+  params.dirCouplersDiffusionTailUm = static_cast<float>(getDoubleAtTime(data->dirDiffusionTailUm, time, 200.0));
+  params.dirCouplersDiffusionTailWeight = static_cast<float>(getDoubleAtTime(data->dirDiffusionTailWeight, time, 0.06));
   params.dirCouplersInhibitionSameLayer = static_cast<float>(getDoubleAtTime(data->dirInhibitionSameLayer, time, 1.0));
   params.dirCouplersInhibitionInterlayer = static_cast<float>(getDoubleAtTime(data->dirInhibitionInterlayer, time, 1.0));
-  double dirGammaSameLayerRgb[3] = {0.336, 0.319, 0.273};
+  double dirGammaSameLayerRgb[3] = {0.341, 0.324, 0.273};
   if (data->dirGammaSameLayerRgb) {
     gParamHost->paramGetValueAtTime(
       data->dirGammaSameLayerRgb,
@@ -1159,15 +1179,15 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
       &dirGammaSameLayerRgb[2]
     );
   }
-  double dirGammaRToGb[2] = {0.353, 0.302};
+  double dirGammaRToGb[2] = {0.355, 0.305};
   if (data->dirGammaRToGb) {
     gParamHost->paramGetValueAtTime(data->dirGammaRToGb, time, &dirGammaRToGb[0], &dirGammaRToGb[1]);
   }
-  double dirGammaGToRb[2] = {0.154, 0.353};
+  double dirGammaGToRb[2] = {0.154, 0.358};
   if (data->dirGammaGToRb) {
     gParamHost->paramGetValueAtTime(data->dirGammaGToRb, time, &dirGammaGToRb[0], &dirGammaGToRb[1]);
   }
-  double dirGammaBToRg[2] = {0.168, 0.226};
+  double dirGammaBToRg[2] = {0.171, 0.225};
   if (data->dirGammaBToRg) {
     gParamHost->paramGetValueAtTime(data->dirGammaBToRg, time, &dirGammaBToRg[0], &dirGammaBToRg[1]);
   }
@@ -2354,6 +2374,8 @@ spektrafilm::RenderParams lutSafeParams(spektrafilm::RenderParams params) {
   params.cameraDiffusionEnabled = false;
   params.printDiffusionEnabled = false;
   params.dirCouplersDiffusionUm = 0.0f;
+  params.dirCouplersDiffusionTailUm = 0.0f;
+  params.dirCouplersDiffusionTailWeight = 0.0f;
   params.enlargerScale = 1.0f;
   params.enlargerOffsetXPercent = 0.0f;
   params.enlargerOffsetYPercent = 0.0f;
@@ -2563,6 +2585,8 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "printerLightCalibration", data->printerLightCalibration);
   cacheParam(paramSet, "dirAmount", data->dirAmount);
   cacheParam(paramSet, "dirDiffusionUm", data->dirDiffusionUm);
+  cacheParam(paramSet, "dirDiffusionTailUm", data->dirDiffusionTailUm);
+  cacheParam(paramSet, "dirDiffusionTailWeight", data->dirDiffusionTailWeight);
   cacheParam(paramSet, "dirInhibitionSameLayer", data->dirInhibitionSameLayer);
   cacheParam(paramSet, "dirInhibitionInterlayer", data->dirInhibitionInterlayer);
   cacheParam(paramSet, "dirGammaSameLayerRgb", data->dirGammaSameLayerRgb);
@@ -3168,7 +3192,12 @@ int dirRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeUm)
   if (params.dirCouplersAmount <= 0.0f || params.dirCouplersDiffusionUm <= 0.0f || pixelSizeUm <= 0.0) {
     return 0;
   }
-  return clampedKernelRadius(params.dirCouplersDiffusionUm / pixelSizeUm, 96);
+  double maxSigmaUm = params.dirCouplersDiffusionUm;
+  if (params.dirCouplersDiffusionTailUm > 0.0f && params.dirCouplersDiffusionTailWeight > 0.0f) {
+    constexpr double kMaxExpGaussianFitSigmaScale = 2.7684;
+    maxSigmaUm = std::max(maxSigmaUm, static_cast<double>(params.dirCouplersDiffusionTailUm) * kMaxExpGaussianFitSigmaScale);
+  }
+  return clampedKernelRadius(maxSigmaUm / pixelSizeUm, 256);
 }
 
 int grainRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeUm) {
@@ -3393,8 +3422,8 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
 
   const char *processOptions[] = {"Print simulation", "Scan negative"};
   defineChoice(paramSet, "process", "Mode", processOptions, 2, 0, "colorGroup");
-  const char *rgbToRawOptions[] = {"Hanatos 2025", "Mallett 2019"};
-  defineChoice(paramSet, "rgbToRawMethod", "RGB to Raw", rgbToRawOptions, 2, 0, "filmGroup");
+  const char *rgbToRawOptions[] = {"Hanatos 2026", "Hanatos 2025", "Mallett 2019"};
+  defineChoice(paramSet, "rgbToRawMethod", "RGB to Raw", rgbToRawOptions, 3, 0, "filmGroup");
   const char *colorSpaces[] = {
     "ARRI LogC4",
     "ARRI LogC3 EI800",
@@ -3528,12 +3557,14 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   }
   defineDouble(paramSet, "dirAmount", "Amount", 0.0, 0.0, 2.0, "couplerGroup");
   defineDouble(paramSet, "dirDiffusionUm", "Diffusion um", 20.0, 0.0, 100.0, "couplerGroup");
+  defineDouble(paramSet, "dirDiffusionTailUm", "Tail um", 200.0, 0.0, 1000.0, "couplerGroup");
+  defineDouble(paramSet, "dirDiffusionTailWeight", "Tail Weight", 0.06, 0.0, 1.0, "couplerGroup");
   defineDouble(paramSet, "dirInhibitionSameLayer", "Same-Layer Inhibition", 1.0, 0.0, 2.0, "couplerGroup");
   defineDouble(paramSet, "dirInhibitionInterlayer", "Interlayer Inhibition", 1.0, 0.0, 2.0, "couplerGroup");
-  defineDouble3DRange(paramSet, "dirGammaSameLayerRgb", "Same-Layer Gamma RGB", 0.336, 0.319, 0.273, 0.0, 1.0, "couplerGroup");
-  defineDouble2DRange(paramSet, "dirGammaRToGb", "R -> G/B Gamma", 0.353, 0.302, 0.0, 1.0, "couplerGroup");
-  defineDouble2DRange(paramSet, "dirGammaGToRb", "G -> R/B Gamma", 0.154, 0.353, 0.0, 1.0, "couplerGroup");
-  defineDouble2DRange(paramSet, "dirGammaBToRg", "B -> R/G Gamma", 0.168, 0.226, 0.0, 1.0, "couplerGroup");
+  defineDouble3DRange(paramSet, "dirGammaSameLayerRgb", "Same-Layer Gamma RGB", 0.341, 0.324, 0.273, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaRToGb", "R -> G/B Gamma", 0.355, 0.305, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaGToRb", "G -> R/B Gamma", 0.154, 0.358, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaBToRg", "B -> R/G Gamma", 0.171, 0.225, 0.0, 1.0, "couplerGroup");
   definePushButton(paramSet, "dirCalibrateToStock", "Calibrate to Stock", "couplerGroup");
   defineHiddenBool(paramSet, "dirUsesStockCalibration", true);
   defineBool(paramSet, "grainEnabled", "Enabled", false, "grainGroup");

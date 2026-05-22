@@ -52,6 +52,8 @@ struct SpektraKernelParams {
   uint printerLightCalibration;
   float dirCouplersAmount;
   float dirCouplersDiffusionUm;
+  float dirCouplersDiffusionTailUm;
+  float dirCouplersDiffusionTailWeight;
   uint grainEnabled;
   int grainModel;
   int filmFormat;
@@ -2972,6 +2974,17 @@ static float spektra_dir_blur_sigma(constant SpektraKernelParams &params) {
   return max(params.dirCouplersDiffusionUm, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
 }
 
+static float spektra_dir_tail_sigma(constant SpektraKernelParams &params, uint component) {
+  constexpr float3 kExpGaussianFitSigmaScale = float3(0.5360, 1.5236, 2.7684);
+  return max(params.dirCouplersDiffusionTailUm, 0.0) *
+    kExpGaussianFitSigmaScale[component] / max(params.filmPixelSizeUm, 1.0e-6);
+}
+
+static float spektra_dir_tail_amplitude(uint component) {
+  constexpr float3 kExpGaussianFitAmplitude = float3(0.1633, 0.6496, 0.1870);
+  return kExpGaussianFitAmplitude[component];
+}
+
 static float3 spektra_halation_scatter_core_sigma(constant SpektraKernelParams &params) {
   constexpr float3 kScatterCoreUm = float3(2.6, 2.3, 1.8);
   return kScatterCoreUm * max(params.scatterScale, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
@@ -3606,6 +3619,68 @@ kernel void spektrafilm_dir_blur_y(
     weightSum += weight;
   }
   correctionOut[index] = value / max(weightSum, 1.0e-8);
+}
+
+kernel void spektrafilm_dir_tail_blur_x(
+  device const float4 *correctionIn [[buffer(0)]],
+  device float4 *correctionOut [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  constant uint &component [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float sigma = spektra_dir_tail_sigma(params, component);
+  if (sigma <= 1.0e-4) {
+    correctionOut[index] = correctionIn[index];
+    return;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  float4 value = float4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = spektra_gaussian_weight(float(offset), sigma);
+    value += weight * spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, int(gid.x) + offset, int(gid.y));
+    weightSum += weight;
+  }
+  correctionOut[index] = value / max(weightSum, 1.0e-8);
+}
+
+kernel void spektrafilm_dir_tail_blur_y_accumulate(
+  device const float4 *correctionIn [[buffer(0)]],
+  device float4 *correctionInOut [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  constant uint &component [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float sigma = spektra_dir_tail_sigma(params, component);
+  float4 blurred = correctionIn[index];
+  if (sigma > 1.0e-4) {
+    const int radius = min(int(ceil(3.0 * sigma)), 256);
+    float4 value = float4(0.0);
+    float weightSum = 0.0;
+    for (int offset = -radius; offset <= radius; ++offset) {
+      const float weight = spektra_gaussian_weight(float(offset), sigma);
+      value += weight * spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, int(gid.x), int(gid.y) + offset);
+      weightSum += weight;
+    }
+    blurred = value / max(weightSum, 1.0e-8);
+  }
+  const float tailWeight = clamp(params.dirCouplersDiffusionTailWeight, 0.0, 1.0);
+  float4 base = correctionInOut[index];
+  if (component == 0u) {
+    base.rgb *= 1.0 - tailWeight;
+  }
+  base.rgb += tailWeight * spektra_dir_tail_amplitude(component) * blurred.rgb;
+  correctionInOut[index] = base;
 }
 
 kernel void spektrafilm_dir_redevelop(

@@ -19,6 +19,7 @@ enum class RenderOutputMode : int32_t {
 enum class RgbToRawMethod : int32_t {
   Hanatos2025 = 0,
   Mallett2019 = 1,
+  Hanatos2026 = 2,
 };
 
 enum class AutoExposureMethod : int32_t {
@@ -113,7 +114,7 @@ enum class ColorSpace : int32_t {
 struct RenderParams {
   ProcessMode process = ProcessMode::PrintSimulation;
   RenderOutputMode renderOutput = RenderOutputMode::FinalPreview;
-  RgbToRawMethod rgbToRawMethod = RgbToRawMethod::Hanatos2025;
+  RgbToRawMethod rgbToRawMethod = RgbToRawMethod::Hanatos2026;
   ColorSpace inputColorSpace = ColorSpace::ArriLogC4;
   ColorSpace outputColorSpace = ColorSpace::Rec709Gamma24;
   OutputRole outputRole = OutputRole::DisplaySdr;
@@ -164,17 +165,19 @@ struct RenderParams {
 
   float dirCouplersAmount = 0.0f;
   float dirCouplersDiffusionUm = 20.0f;
+  float dirCouplersDiffusionTailUm = 200.0f;
+  float dirCouplersDiffusionTailWeight = 0.06f;
   float dirCouplersInhibitionSameLayer = 1.0f;
   float dirCouplersInhibitionInterlayer = 1.0f;
-  float dirCouplersGammaSameLayerR = 0.336f;
-  float dirCouplersGammaSameLayerG = 0.319f;
+  float dirCouplersGammaSameLayerR = 0.341f;
+  float dirCouplersGammaSameLayerG = 0.324f;
   float dirCouplersGammaSameLayerB = 0.273f;
-  float dirCouplersGammaRToG = 0.353f;
-  float dirCouplersGammaRToB = 0.302f;
+  float dirCouplersGammaRToG = 0.355f;
+  float dirCouplersGammaRToB = 0.305f;
   float dirCouplersGammaGToR = 0.154f;
-  float dirCouplersGammaGToB = 0.353f;
-  float dirCouplersGammaBToR = 0.168f;
-  float dirCouplersGammaBToG = 0.226f;
+  float dirCouplersGammaGToB = 0.358f;
+  float dirCouplersGammaBToR = 0.171f;
+  float dirCouplersGammaBToG = 0.225f;
 
   bool grainEnabled = true;
   GrainModel grainModel = GrainModel::Preview;

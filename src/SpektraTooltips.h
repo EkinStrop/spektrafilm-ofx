@@ -75,6 +75,8 @@ inline constexpr TooltipEntry kTooltipEntries[] = {
   {"printerLightCalibration", "Apply generated neutral APD calibration offsets. Disable to use raw printer-light values."},
   {"dirAmount", "Overall DIR coupler redevelopment strength. 0 bypasses the effect; 1.0 matches the reference strength."},
   {"dirDiffusionUm", "Lateral diffusion distance for DIR inhibition before redevelopment, in micrometers."},
+  {"dirDiffusionTailUm", "Long exponential-tail diffusion distance for DIR inhibition, in micrometers."},
+  {"dirDiffusionTailWeight", "Blend from Gaussian DIR diffusion toward the long exponential-tail diffusion model."},
   {"dirInhibitionSameLayer", "Scales same-layer inhibition terms, which mainly shape layer contrast."},
   {"dirInhibitionInterlayer", "Scales interlayer inhibition terms, which mainly shape color separation."},
   {"dirGammaSameLayerRgb", "Same-layer DIR gamma for the red, green, and blue donor layers."},

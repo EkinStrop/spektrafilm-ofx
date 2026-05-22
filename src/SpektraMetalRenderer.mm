@@ -173,6 +173,8 @@ struct KernelParams {
   uint32_t printerLightCalibration;
   float dirCouplersAmount;
   float dirCouplersDiffusionUm;
+  float dirCouplersDiffusionTailUm;
+  float dirCouplersDiffusionTailWeight;
   uint32_t grainEnabled;
   int32_t grainModel;
   int32_t filmFormat;
@@ -396,6 +398,7 @@ struct KernelDiffusionComponent {
 struct StaticProfileResources {
   int32_t film = -1;
   int32_t paper = -1;
+  RgbToRawMethod rgbToRawMethod = RgbToRawMethod::Hanatos2026;
   bool cameraUvFilterEnabled = false;
   float cameraUvCutNm = 410.0f;
   bool cameraIrFilterEnabled = false;
@@ -438,6 +441,7 @@ struct StaticProfileResources {
   bool validFor(const RenderParams &params) const {
     return film == params.film &&
            paper == params.paper &&
+           rgbToRawMethod == params.rgbToRawMethod &&
            cameraUvFilterEnabled == params.cameraUvFilterEnabled &&
            cameraUvCutNm == params.cameraUvCutNm &&
            cameraIrFilterEnabled == params.cameraIrFilterEnabled &&
@@ -867,6 +871,8 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.printerLightCalibration = params.printerLightCalibration ? 1u : 0u;
   out.dirCouplersAmount = params.dirCouplersAmount;
   out.dirCouplersDiffusionUm = params.dirCouplersDiffusionUm;
+  out.dirCouplersDiffusionTailUm = params.dirCouplersDiffusionTailUm;
+  out.dirCouplersDiffusionTailWeight = params.dirCouplersDiffusionTailWeight;
   out.grainEnabled = params.grainEnabled ? 1u : 0u;
   out.grainModel = static_cast<int32_t>(params.grainModel);
   out.filmFormat = static_cast<int32_t>(params.filmFormat);
@@ -1344,17 +1350,57 @@ std::vector<float> makeHanatosRawResponse(
   const ProfileCurveSet &filmCurves,
   const std::vector<float> &linearSensitivity,
   const std::vector<float> &hanatosSpectra,
-  const HanatosSpectraLutInfo &hanatos
+  const HanatosSpectraLutInfo &hanatos,
+  RgbToRawMethod method
 ) {
   const size_t responseCount = static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * 3u;
   std::vector<float> response(responseCount, 0.0f);
   const size_t expectedSpectra = static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * static_cast<size_t>(hanatos.wavelengthCount);
-  if (!filmCurves.bandpassHanatos2025 ||
-      hanatos.width == 0 ||
+  if (hanatos.width == 0 ||
       hanatos.height == 0 ||
       hanatos.wavelengthCount == 0 ||
       hanatosSpectra.size() < expectedSpectra ||
       linearSensitivity.size() < static_cast<size_t>(hanatos.wavelengthCount) * 3u) {
+    return response;
+  }
+
+  std::vector<float> hanatos2026Window(hanatos.wavelengthCount, 1.0f);
+  std::array<float, 3> hanatos2026Normalization = {1.0f, 1.0f, 1.0f};
+  const bool useHanatos2026 =
+    method == RgbToRawMethod::Hanatos2026 &&
+    filmCurves.hanatos2026WindowParams &&
+    filmCurves.referenceIlluminantSpectrum;
+  if (useHanatos2026) {
+    constexpr float kSqrt2 = 1.4142135623730951f;
+    const float cUv = filmCurves.hanatos2026WindowParams[0];
+    const float sigmaUv = filmCurves.hanatos2026WindowParams[1];
+    const float cIr = filmCurves.hanatos2026WindowParams[2];
+    const float sigmaIr = filmCurves.hanatos2026WindowParams[3];
+    if (sigmaUv > 0.0f && sigmaIr > 0.0f) {
+      std::array<float, 3> numerator = {0.0f, 0.0f, 0.0f};
+      std::array<float, 3> denominator = {0.0f, 0.0f, 0.0f};
+      for (uint32_t wavelength = 0; wavelength < hanatos.wavelengthCount; ++wavelength) {
+        const float wl = filmCurves.wavelengths ? filmCurves.wavelengths[wavelength] : 0.0f;
+        const float edgeUv = smoothErfEdge(wl, cUv, sigmaUv * kSqrt2);
+        const float edgeIr = smoothErfEdge(wl, cIr, -sigmaIr * kSqrt2);
+        const float window = edgeUv * edgeIr;
+        hanatos2026Window[wavelength] = window;
+        const float illuminant = filmCurves.referenceIlluminantSpectrum[wavelength];
+        const uint32_t sensitivityOffset = wavelength * 3u;
+        for (uint32_t channel = 0; channel < 3u; ++channel) {
+          const float referenceResponse = linearSensitivity[sensitivityOffset + channel] * illuminant;
+          denominator[channel] += referenceResponse;
+          numerator[channel] += referenceResponse * window;
+        }
+      }
+      for (uint32_t channel = 0; channel < 3u; ++channel) {
+        hanatos2026Normalization[channel] =
+          numerator[channel] / std::max(denominator[channel], 1.0e-10f);
+        hanatos2026Normalization[channel] = std::max(hanatos2026Normalization[channel], 1.0e-10f);
+      }
+    }
+  }
+  if (!useHanatos2026 && !filmCurves.bandpassHanatos2025) {
     return response;
   }
 
@@ -1365,9 +1411,16 @@ std::vector<float> makeHanatosRawResponse(
       for (uint32_t wavelength = 0; wavelength < hanatos.wavelengthCount; ++wavelength) {
         const float spectrum = hanatosSpectra[spectraOffset + wavelength];
         const uint32_t sensitivityOffset = wavelength * 3u;
-        raw[0] += spectrum * linearSensitivity[sensitivityOffset] * filmCurves.bandpassHanatos2025[sensitivityOffset];
-        raw[1] += spectrum * linearSensitivity[sensitivityOffset + 1u] * filmCurves.bandpassHanatos2025[sensitivityOffset + 1u];
-        raw[2] += spectrum * linearSensitivity[sensitivityOffset + 2u] * filmCurves.bandpassHanatos2025[sensitivityOffset + 2u];
+        if (useHanatos2026) {
+          const float window = hanatos2026Window[wavelength];
+          raw[0] += spectrum * linearSensitivity[sensitivityOffset] * window / hanatos2026Normalization[0];
+          raw[1] += spectrum * linearSensitivity[sensitivityOffset + 1u] * window / hanatos2026Normalization[1];
+          raw[2] += spectrum * linearSensitivity[sensitivityOffset + 2u] * window / hanatos2026Normalization[2];
+        } else {
+          raw[0] += spectrum * linearSensitivity[sensitivityOffset] * filmCurves.bandpassHanatos2025[sensitivityOffset];
+          raw[1] += spectrum * linearSensitivity[sensitivityOffset + 1u] * filmCurves.bandpassHanatos2025[sensitivityOffset + 1u];
+          raw[2] += spectrum * linearSensitivity[sensitivityOffset + 2u] * filmCurves.bandpassHanatos2025[sensitivityOffset + 2u];
+        }
       }
       const size_t responseOffset = (static_cast<size_t>(x) * hanatos.height + y) * 3u;
       response[responseOffset] = raw[0];
@@ -1817,6 +1870,8 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> dirBaselinePipeline = nil;
   id<MTLComputePipelineState> dirBlurXPipeline = nil;
   id<MTLComputePipelineState> dirBlurYPipeline = nil;
+  id<MTLComputePipelineState> dirTailBlurXPipeline = nil;
+  id<MTLComputePipelineState> dirTailBlurYAccumulatePipeline = nil;
   id<MTLComputePipelineState> dirRedevelopPipeline = nil;
   id<MTLComputePipelineState> previewGrainFromDensityPipeline = nil;
   id<MTLComputePipelineState> productionGrainLayersFromDensityPipeline = nil;
@@ -2077,8 +2132,17 @@ struct MetalRenderer::Impl {
       lastError = "Unable to locate generated paper density curves.";
       return false;
     }
-    if (filmCurves->wavelengthCount == 0 || !filmCurves->wavelengths || !filmCurves->logSensitivity || !filmCurves->bandpassHanatos2025) {
+    if (filmCurves->wavelengthCount == 0 || !filmCurves->wavelengths || !filmCurves->logSensitivity) {
       lastError = "Unable to locate generated film spectral data.";
+      return false;
+    }
+    if (params.rgbToRawMethod == RgbToRawMethod::Hanatos2025 && !filmCurves->bandpassHanatos2025) {
+      lastError = "Unable to locate archived Hanatos 2025 film bandpass data.";
+      return false;
+    }
+    if (params.rgbToRawMethod == RgbToRawMethod::Hanatos2026 &&
+        (!filmCurves->hanatos2026WindowParams || !filmCurves->referenceIlluminantSpectrum)) {
+      lastError = "Unable to locate generated Hanatos 2026 film adaptation data.";
       return false;
     }
     if (paperCurves->wavelengthCount != filmCurves->wavelengthCount || !paperCurves->logSensitivity) {
@@ -2119,6 +2183,7 @@ struct MetalRenderer::Impl {
     StaticProfileResources next{};
     next.film = params.film;
     next.paper = params.paper;
+    next.rgbToRawMethod = params.rgbToRawMethod;
     next.cameraUvFilterEnabled = params.cameraUvFilterEnabled;
     next.cameraUvCutNm = params.cameraUvCutNm;
     next.cameraIrFilterEnabled = params.cameraIrFilterEnabled;
@@ -2183,7 +2248,8 @@ struct MetalRenderer::Impl {
       *filmCurves,
       filmSensitivityLinear,
       hanatosSpectraData,
-      hanatosSpectraLutInfo()
+      hanatosSpectraLutInfo(),
+      params.rgbToRawMethod
     );
 
     std::vector<float> paperScanDensityData;
@@ -2208,13 +2274,20 @@ struct MetalRenderer::Impl {
     scanToOutputRgbData.insert(scanToOutputRgbData.end(), filmCurves->scanToOutputRgb, filmCurves->scanToOutputRgb + kSpektraColorSpaceCount * 9u);
     scanToOutputRgbData.insert(scanToOutputRgbData.end(), paperCurves->scanToOutputRgb, paperCurves->scanToOutputRgb + kSpektraColorSpaceCount * 9u);
 
+    std::vector<float> unityHanatosBandpass;
+    const float *bandpassHanatosData = filmCurves->bandpassHanatos2025;
+    if (!bandpassHanatosData) {
+      unityHanatosBandpass.assign(static_cast<size_t>(filmCurves->wavelengthCount) * 3u, 1.0f);
+      bandpassHanatosData = unityHanatosBandpass.data();
+    }
+
     next.curveInfoBuffer = newSharedBuffer(&next.curveInfo, sizeof(next.curveInfo), "film curve info");
     next.logExposureBuffer = newSharedBuffer(filmCurves->logExposure, logExposureBytes, "film log exposure");
     next.densityCurvesBuffer = newSharedBuffer(filmCurves->densityCurves, densityCurveBytes, "film density curves");
     next.spectralInfoBuffer = newSharedBuffer(&next.spectralInfo, sizeof(next.spectralInfo), "spectral info");
     next.wavelengthsBuffer = newSharedBuffer(filmCurves->wavelengths, wavelengthBytes, "film wavelengths");
     next.logSensitivityBuffer = newSharedBuffer(filmSensitivityLinear.data(), sensitivityBytes, "film linear sensitivity");
-    next.bandpassHanatosBuffer = newSharedBuffer(filmCurves->bandpassHanatos2025, sensitivityBytes, "film Hanatos bandpass");
+    next.bandpassHanatosBuffer = newSharedBuffer(bandpassHanatosData, sensitivityBytes, "film Hanatos bandpass");
     next.hanatosRawResponseBuffer = newSharedBuffer(hanatosRawResponse.data(), hanatosRawResponse.size() * sizeof(float), "film Hanatos raw response");
     next.mallettBasisIlluminantBuffer = newSharedBuffer(mallettRawMatrix.data(), mallettRawMatrix.size() * sizeof(float), "film Mallett raw matrix");
     next.inputToReferenceXyzBuffer = newSharedBuffer(filmCurves->inputToReferenceXyz, inputMatrixBytes, "input to reference XYZ");
@@ -2388,6 +2461,8 @@ struct MetalRenderer::Impl {
       dirBaselinePipeline = makePipeline(@"spektrafilm_dir_baseline");
       dirBlurXPipeline = makePipeline(@"spektrafilm_dir_blur_x");
       dirBlurYPipeline = makePipeline(@"spektrafilm_dir_blur_y");
+      dirTailBlurXPipeline = makePipeline(@"spektrafilm_dir_tail_blur_x");
+      dirTailBlurYAccumulatePipeline = makePipeline(@"spektrafilm_dir_tail_blur_y_accumulate");
       dirRedevelopPipeline = makePipeline(@"spektrafilm_dir_redevelop");
       previewGrainFromDensityPipeline = makePipeline(@"spektrafilm_preview_grain_from_density");
       productionGrainLayersFromDensityPipeline = makePipeline(@"spektrafilm_production_grain_layers_from_density");
@@ -2447,7 +2522,8 @@ struct MetalRenderer::Impl {
           !diffusionGroupBlurXPipeline || !diffusionGroupBlurYAccumulatePipeline || !diffusionResolvePipeline ||
           !developFromLogRawPipeline ||
           !dirCorrectionFromDensityPipeline || !copyBufferPipeline ||
-          !dirBaselinePipeline || !dirBlurXPipeline || !dirBlurYPipeline || !dirRedevelopPipeline ||
+          !dirBaselinePipeline || !dirBlurXPipeline || !dirBlurYPipeline ||
+          !dirTailBlurXPipeline || !dirTailBlurYAccumulatePipeline || !dirRedevelopPipeline ||
           !previewGrainFromDensityPipeline || !productionGrainLayersFromDensityPipeline ||
           !grainLayerBlurXPipeline || !grainLayerBlurYPipeline ||
           !grainMicroSourcePipeline || !grainMicroBlurXPipeline || !grainMicroBlurYPipeline || !grainResolveDensityPipeline ||
@@ -2514,7 +2590,8 @@ bool MetalRenderer::isAvailable() const {
     impl_->diffusionComponentBlurYAccumulatePipeline &&
     impl_->diffusionGroupBlurXPipeline && impl_->diffusionGroupBlurYAccumulatePipeline && impl_->diffusionResolvePipeline &&
     impl_->developFromLogRawPipeline && impl_->dirCorrectionFromDensityPipeline && impl_->copyBufferPipeline &&
-    impl_->dirBaselinePipeline && impl_->dirBlurXPipeline && impl_->dirBlurYPipeline && impl_->dirRedevelopPipeline &&
+    impl_->dirBaselinePipeline && impl_->dirBlurXPipeline && impl_->dirBlurYPipeline &&
+    impl_->dirTailBlurXPipeline && impl_->dirTailBlurYAccumulatePipeline && impl_->dirRedevelopPipeline &&
     impl_->previewGrainFromDensityPipeline && impl_->productionGrainLayersFromDensityPipeline &&
     impl_->grainLayerBlurXPipeline && impl_->grainLayerBlurYPipeline &&
     impl_->grainMicroSourcePipeline && impl_->grainMicroBlurXPipeline && impl_->grainMicroBlurYPipeline &&
@@ -2622,6 +2699,11 @@ bool MetalRenderer::render(
       needsHalationLogRawPath &&
       (params.scatterAmount > 0.0f || params.halationAmount > 0.0f);
     const bool dirPath = params.dirCouplersAmount > 0.0f && needsFilmDensityPath;
+    const bool dirTailPath =
+      dirPath &&
+      params.dirCouplersDiffusionUm > 0.0f &&
+      params.dirCouplersDiffusionTailUm > 0.0f &&
+      params.dirCouplersDiffusionTailWeight > 0.0f;
     const bool productionGrainPath =
       params.grainEnabled &&
       params.grainModel == GrainModel::Production &&
@@ -2777,6 +2859,7 @@ bool MetalRenderer::render(
     id<MTLBuffer> dirDensityBufferB = (dirPath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "DIR density B") : nil;
     id<MTLBuffer> dirCorrectionBufferA = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction A") : nil;
     id<MTLBuffer> dirCorrectionBufferB = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction B") : nil;
+    id<MTLBuffer> dirCorrectionBufferC = dirTailPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction C") : nil;
     id<MTLBuffer> grainLayerBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer A") : nil;
     id<MTLBuffer> grainLayerBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer B") : nil;
     id<MTLBuffer> grainMicroBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro A") : nil;
@@ -2836,7 +2919,8 @@ bool MetalRenderer::render(
       return false;
     }
     if (dirPath && (!dirInfoBuffer || !dirCorrectedDensityCurvesBuffer || !dirLogRawBuffer || !dirDensityBufferA ||
-        !dirCorrectionBufferA || !dirCorrectionBufferB || (previewGrainFromDensityPath && !dirDensityBufferB))) {
+        !dirCorrectionBufferA || !dirCorrectionBufferB || (dirTailPath && !dirCorrectionBufferC) ||
+        (previewGrainFromDensityPath && !dirDensityBufferB))) {
       impl_->lastError = "Unable to allocate DIR coupler Metal buffers.";
       return false;
     }
@@ -3334,6 +3418,46 @@ bool MetalRenderer::render(
       return blurYBuffer;
     };
 
+    auto encodeDirCorrectionBlur = [&](id<MTLBuffer> correctionBuffer) -> id<MTLBuffer> {
+      id<MTLBuffer> finalCorrectionBuffer = dirTailPath ? dirCorrectionBufferC : dirCorrectionBufferA;
+
+      [encoder setComputePipelineState:impl_->dirBlurXPipeline];
+      [encoder setBuffer:correctionBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->dirBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->dirBlurYPipeline];
+      [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
+      [encoder setBuffer:finalCorrectionBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->dirBlurYPipeline);
+
+      if (dirTailPath) {
+        for (uint32_t component = 0; component < 3u; ++component) {
+          [encoder setComputePipelineState:impl_->dirTailBlurXPipeline];
+          [encoder setBuffer:correctionBuffer offset:0 atIndex:0];
+          [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          dispatch2D(impl_->dirTailBlurXPipeline);
+
+          [encoder setComputePipelineState:impl_->dirTailBlurYAccumulatePipeline];
+          [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
+          [encoder setBuffer:finalCorrectionBuffer offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          dispatch2D(impl_->dirTailBlurYAccumulatePipeline);
+        }
+      }
+
+      return finalCorrectionBuffer;
+    };
+
     auto encodeDevelopFromLogRaw = [&](id<MTLBuffer> logRawBuffer, id<MTLBuffer> densityBuffer) {
       [encoder setComputePipelineState:impl_->developFromLogRawPipeline];
       [encoder setBuffer:logRawBuffer offset:0 atIndex:0];
@@ -3795,23 +3919,11 @@ bool MetalRenderer::render(
           [encoder setBuffer:dirInfoBuffer offset:0 atIndex:4];
           dispatch2D(impl_->dirCorrectionFromDensityPipeline);
 
-          [encoder setComputePipelineState:impl_->dirBlurXPipeline];
-          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:0];
-          [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          dispatch2D(impl_->dirBlurXPipeline);
-
-          [encoder setComputePipelineState:impl_->dirBlurYPipeline];
-          [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
-          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          dispatch2D(impl_->dirBlurYPipeline);
+          id<MTLBuffer> blurredDirCorrectionBuffer = encodeDirCorrectionBlur(dirCorrectionBufferA);
 
           [encoder setComputePipelineState:impl_->dirRedevelopPipeline];
           [encoder setBuffer:halationLogRawBuffer offset:0 atIndex:0];
-          [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+          [encoder setBuffer:blurredDirCorrectionBuffer offset:0 atIndex:1];
           [encoder setBuffer:halationDensityBufferA offset:0 atIndex:2];
           [encoder setBuffer:paramBuffer offset:0 atIndex:3];
           [encoder setBytes:dims length:sizeof(dims) atIndex:4];
@@ -3864,23 +3976,11 @@ bool MetalRenderer::render(
       [encoder setBuffer:dirInfoBuffer offset:0 atIndex:19];
       dispatch2D(impl_->dirBaselinePipeline);
 
-      [encoder setComputePipelineState:impl_->dirBlurXPipeline];
-      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:0];
-      [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->dirBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->dirBlurYPipeline];
-      [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
-      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->dirBlurYPipeline);
+      id<MTLBuffer> blurredDirCorrectionBuffer = encodeDirCorrectionBlur(dirCorrectionBufferA);
 
       [encoder setComputePipelineState:impl_->dirRedevelopPipeline];
       [encoder setBuffer:dirLogRawBuffer offset:0 atIndex:0];
-      [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
+      [encoder setBuffer:blurredDirCorrectionBuffer offset:0 atIndex:1];
       [encoder setBuffer:dirDensityBufferA offset:0 atIndex:2];
       [encoder setBuffer:paramBuffer offset:0 atIndex:3];
       [encoder setBytes:dims length:sizeof(dims) atIndex:4];

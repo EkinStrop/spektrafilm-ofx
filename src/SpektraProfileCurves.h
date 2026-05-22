@@ -29,6 +29,8 @@ struct ProfileCurveSet {
   const float *wavelengths = nullptr;
   const float *logSensitivity = nullptr;
   const float *bandpassHanatos2025 = nullptr;
+  const float *hanatos2026WindowParams = nullptr;
+  const float *referenceIlluminantSpectrum = nullptr;
   const float *inputToReferenceXyz = nullptr;
   const float *inputToSrgb = nullptr;
   const float *mallettBasisIlluminant = nullptr;

@@ -17,6 +17,7 @@ OFX_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("SPEKTRAFILM_DATA_DIR", OFX_ROOT / "Resources" / "data"))
 os.environ.setdefault("SPEKTRAFILM_DATA_DIR", str(DATA_DIR))
 PROFILE_DIR = DATA_DIR / "profiles"
+ARCHIVE_PROFILE_DIR = PROFILE_DIR / "archive"
 ST2065_2_DIR = DATA_DIR / "standards" / "smpte_st_2065_2"
 ST2065_2_APD_RESPONSIVITIES_CSV = "st2065-2a-2020.csv"
 ST2065_2_INFLUX_SPECTRUM_CSV = "st2065-2b-2020.csv"
@@ -239,6 +240,42 @@ COLOR_SPACES = [
 
 def _load_profile(stock: str) -> dict:
     return json.loads((PROFILE_DIR / f"{stock}.json").read_text(encoding="utf-8"))
+
+
+def _load_archive_profile(stock: str) -> dict | None:
+    path = ARCHIVE_PROFILE_DIR / f"{stock}.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _legacy_info_value(profile: dict, stock: str, key: str):
+    info = profile.get("info", {})
+    if key in info:
+        return info[key]
+    archived = _load_archive_profile(stock)
+    if archived is not None:
+        return archived.get("info", {}).get(key)
+    return None
+
+
+def _archived_bandpass_hanatos2025(stock: str) -> list[list[float | None]] | None:
+    archived = _load_archive_profile(stock)
+    if archived is None:
+        return None
+    bandpass = archived.get("data", {}).get("bandpass_hanatos2025", [])
+    if not bandpass:
+        return None
+    return [[None if value is None else float(value) for value in row] for row in bandpass]
+
+
+def _hanatos2026_window_params(profile: dict) -> list[float]:
+    values = profile.get("data", {}).get("hanatos2025_adaptation_window_params", [])
+    if not values:
+        return [0.0, 0.0, 0.0, 0.0]
+    if len(values) != 4:
+        raise ValueError("hanatos2025_adaptation_window_params must contain four values")
+    return [float(value) for value in values]
 
 
 def _float_literal(value: float | None) -> str:
@@ -532,7 +569,11 @@ def _apd_raw_for_film_density(profile: dict, density_cmy: np.ndarray, apd_respon
 
 
 def _paper_midscale_neutral_log_exposure(profile: dict) -> np.ndarray:
-    target_density = np.asarray(profile["info"]["fitted_cmy_midscale_neutral_density"], dtype=float)
+    stock = profile["info"]["stock"]
+    target_density_value = _legacy_info_value(profile, stock, "fitted_cmy_midscale_neutral_density")
+    if target_density_value is None:
+        raise KeyError(f"Missing fitted_cmy_midscale_neutral_density for paper profile '{stock}'")
+    target_density = np.asarray(target_density_value, dtype=float)
     density_curves = np.asarray(profile["data"]["density_curves"], dtype=float)
     log_exposure = np.asarray(profile["data"]["log_exposure"], dtype=float)
     target_log_exposure = np.zeros(3, dtype=float)
@@ -555,7 +596,10 @@ def _academy_printer_density_neutral_offset_table() -> list[list[float]]:
         paper_target_relative_log = paper_target_log - float(np.mean(paper_target_log))
         for film in FILMS:
             film_profile = _load_profile(film)
-            film_midscale_density = np.asarray(film_profile["info"]["fitted_cmy_midscale_neutral_density"], dtype=float)
+            film_midscale_value = _legacy_info_value(film_profile, film, "fitted_cmy_midscale_neutral_density")
+            if film_midscale_value is None:
+                raise KeyError(f"Missing fitted_cmy_midscale_neutral_density for film profile '{film}'")
+            film_midscale_density = np.asarray(film_midscale_value, dtype=float)
             film_density_minimum = np.asarray(_density_curve_minimum(film_profile), dtype=float)
             film_density_cmy = np.maximum(film_midscale_density - film_density_minimum, 0.0)
             apd_raw = np.maximum(_apd_raw_for_film_density(film_profile, film_density_cmy, apd_responsivities), 1.0e-10)
@@ -629,10 +673,10 @@ def _dir_coupler_defaults(info: dict) -> dict[str, tuple[float, ...]]:
         }
     else:
         defaults = {
-            "same_layer_rgb": (0.336, 0.319, 0.273),
-            "r_to_gb": (0.353, 0.302),
-            "g_to_rb": (0.154, 0.353),
-            "b_to_rg": (0.168, 0.226),
+            "same_layer_rgb": (0.341, 0.324, 0.273),
+            "r_to_gb": (0.355, 0.305),
+            "g_to_rb": (0.154, 0.358),
+            "b_to_rg": (0.171, 0.225),
         }
 
     stock = info["stock"]
@@ -666,10 +710,10 @@ def _emit_group(group_name: str, stocks: list[str]) -> str:
         viewing_illuminant = info["viewing_illuminant"]
         wavelengths = _numeric_vector(profile, "wavelengths")
         log_sensitivity = _numeric_matrix(profile, "log_sensitivity")
-        bandpass_hanatos2025 = _numeric_matrix(profile, "bandpass_hanatos2025")
-        if not bandpass_hanatos2025:
-            bandpass_hanatos2025 = log_sensitivity
+        bandpass_hanatos2025 = _archived_bandpass_hanatos2025(stock)
+        hanatos2026_window_params = _hanatos2026_window_params(profile)
         input_to_xyz = _input_to_reference_xyz_matrices(reference_illuminant)
+        reference_illuminant_spectrum = [float(value) for value in standard_illuminant(reference_illuminant)]
         scan_illuminant = [float(value) for value in standard_illuminant(viewing_illuminant)]
         scan_to_output_rgb = _scan_to_output_rgb_matrices(viewing_illuminant)
         mallett_basis_illuminant = _mallett_basis_illuminant(reference_illuminant)
@@ -685,7 +729,10 @@ def _emit_group(group_name: str, stocks: list[str]) -> str:
         base_density = _numeric_vector(profile, "base_density")
         chunks.append(_array(f"{prefix}_wavelengths", wavelengths))
         chunks.append(_array(f"{prefix}_log_sensitivity", log_sensitivity))
-        chunks.append(_array(f"{prefix}_bandpass_hanatos2025", bandpass_hanatos2025))
+        if bandpass_hanatos2025 is not None:
+            chunks.append(_array(f"{prefix}_bandpass_hanatos2025", bandpass_hanatos2025))
+        chunks.append(_array(f"{prefix}_hanatos2026_window_params", hanatos2026_window_params))
+        chunks.append(_array(f"{prefix}_reference_illuminant_spectrum", reference_illuminant_spectrum))
         chunks.append(_array(f"{prefix}_input_to_reference_xyz", input_to_xyz))
         chunks.append(_array(f"{prefix}_mallett_basis_illuminant", mallett_basis_illuminant))
         chunks.append(_array(f"{prefix}_log_exposure", log_exposure))
@@ -703,6 +750,9 @@ def _emit_group(group_name: str, stocks: list[str]) -> str:
         chunks.append(_array(f"{prefix}_dir_gamma_b_to_rg", [float(value) for value in dir_couplers["b_to_rg"]]))
         chunks.append(_array(f"{prefix}_scan_illuminant", scan_illuminant))
         chunks.append(_array(f"{prefix}_scan_to_output_rgb", scan_to_output_rgb))
+        bandpass_hanatos2025_ptr = (
+            f"{prefix}_bandpass_hanatos2025" if bandpass_hanatos2025 is not None else "nullptr"
+        )
         records.append(
             "  {"
             f"{json.dumps(stock)}, "
@@ -713,7 +763,9 @@ def _emit_group(group_name: str, stocks: list[str]) -> str:
             f"{len(log_exposure)}u, "
             f"{prefix}_wavelengths, "
             f"{prefix}_log_sensitivity, "
-            f"{prefix}_bandpass_hanatos2025, "
+            f"{bandpass_hanatos2025_ptr}, "
+            f"{prefix}_hanatos2026_window_params, "
+            f"{prefix}_reference_illuminant_spectrum, "
             f"{prefix}_input_to_reference_xyz, "
             f"{group_name}_input_to_srgb, "
             f"{prefix}_mallett_basis_illuminant, "

@@ -683,7 +683,7 @@ spektrafilm::RenderParams baseParams(const Options &options, spektrafilm::ColorS
   spektrafilm::RenderParams params;
   params.process = spektrafilm::ProcessMode::PrintSimulation;
   params.renderOutput = spektrafilm::RenderOutputMode::FinalPreview;
-  params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2025;
+  params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2026;
   params.inputColorSpace = inputColorSpace;
   params.outputRole = spektrafilm::OutputRole::DisplaySdr;
   params.outputColorSpace = outputColorSpace;
@@ -796,7 +796,7 @@ int main(int argc, const char **argv) {
     const spektrafilm::RenderParams defaults = baseParams(options, inputColorSpace, spektrafilm::ColorSpace::Rec709Gamma24);
     if (options.diagnostics) {
       std::cerr
-        << "renderParams process=PrintSimulation rgbToRaw=Hanatos2025"
+        << "renderParams process=PrintSimulation rgbToRaw=Hanatos2026"
         << " input=" << colorSpaceLabel(defaults.inputColorSpace)
         << " output=" << colorSpaceLabel(defaults.outputColorSpace)
         << " filmExposureEv=" << defaults.filmExposureEv
