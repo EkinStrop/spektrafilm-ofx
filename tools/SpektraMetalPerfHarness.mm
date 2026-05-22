@@ -51,7 +51,7 @@ struct Options {
 void printUsage(const char *name) {
   std::cerr
     << "Usage: " << name << " [--width N] [--height N] [--iterations N] [--warmup N]\n"
-    << "       [--case default-final|production-grain|enlarged-production-grain|grain-synthesis|grain-synthesis-hq|halation-only|diffusion-only|scanner-only|all-effects|all]\n"
+    << "       [--case default-final|production-grain|enlarged-production-grain|grain-synthesis|grain-synthesis-hq|halation-only|halation-boost|diffusion-only|scanner-only|scanner-glare|all-effects|all]\n"
     << "       [--resource-dir PATH] [--scratch-storage private|shared]\n"
     << "       [--threadgroup auto|16x16|32x8|8x32|64x4]\n"
     << "       [--scanner-image-storage buffer|texture]\n"
@@ -310,6 +310,18 @@ spektrafilm::RenderParams paramsForCase(const std::string &caseName) {
     params.halationAmount = 1.0f;
     return params;
   }
+  if (caseName == "halation-boost") {
+    params.grainEnabled = false;
+    params.cameraDiffusionEnabled = false;
+    params.printDiffusionEnabled = false;
+    params.scannerEnabled = false;
+    params.dirCouplersAmount = 0.0f;
+    params.halationEnabled = true;
+    params.scatterAmount = 1.0f;
+    params.halationAmount = 1.0f;
+    params.halationBoostEv = 1.0f;
+    return params;
+  }
   if (caseName == "diffusion-only") {
     params.grainEnabled = false;
     params.halationEnabled = false;
@@ -333,6 +345,20 @@ spektrafilm::RenderParams paramsForCase(const std::string &caseName) {
     params.scannerUnsharpAmount = 0.7f;
     params.scannerWhiteCorrection = true;
     params.scannerBlackCorrection = true;
+    return params;
+  }
+  if (caseName == "scanner-glare") {
+    params.grainEnabled = false;
+    params.halationEnabled = false;
+    params.cameraDiffusionEnabled = false;
+    params.printDiffusionEnabled = false;
+    params.dirCouplersAmount = 0.0f;
+    params.process = spektrafilm::ProcessMode::PrintSimulation;
+    params.scannerEnabled = true;
+    params.scannerMtf50LpMm = 0.0f;
+    params.scannerUnsharpRadiusUm = 0.0f;
+    params.scannerUnsharpAmount = 0.0f;
+    params.glarePercent = 0.03f;
     return params;
   }
   if (caseName == "all-effects") {
@@ -361,8 +387,10 @@ std::vector<std::string> selectedCases(const std::string &caseName) {
     "grain-synthesis",
     "grain-synthesis-hq",
     "halation-only",
+    "halation-boost",
     "diffusion-only",
     "scanner-only",
+    "scanner-glare",
     "all-effects",
   };
   if (caseName == "all") {

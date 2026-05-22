@@ -169,15 +169,15 @@ struct RenderParams {
   float dirCouplersDiffusionTailWeight = 0.06f;
   float dirCouplersInhibitionSameLayer = 1.0f;
   float dirCouplersInhibitionInterlayer = 1.0f;
-  float dirCouplersGammaSameLayerR = 0.341f;
-  float dirCouplersGammaSameLayerG = 0.324f;
+  float dirCouplersGammaSameLayerR = 0.336f;
+  float dirCouplersGammaSameLayerG = 0.319f;
   float dirCouplersGammaSameLayerB = 0.273f;
-  float dirCouplersGammaRToG = 0.355f;
-  float dirCouplersGammaRToB = 0.305f;
+  float dirCouplersGammaRToG = 0.353f;
+  float dirCouplersGammaRToB = 0.302f;
   float dirCouplersGammaGToR = 0.154f;
-  float dirCouplersGammaGToB = 0.358f;
-  float dirCouplersGammaBToR = 0.171f;
-  float dirCouplersGammaBToG = 0.225f;
+  float dirCouplersGammaGToB = 0.353f;
+  float dirCouplersGammaBToR = 0.168f;
+  float dirCouplersGammaBToG = 0.226f;
 
   bool grainEnabled = true;
   GrainModel grainModel = GrainModel::Preview;
@@ -225,7 +225,7 @@ struct RenderParams {
   float grainSynthesisLayerScale2 = 0.4f;
   bool grainSynthesisLayered = true;
 
-  bool halationEnabled = true;
+  bool halationEnabled = false;
   float scatterAmount = 1.0f;
   float scatterScale = 1.0f;
   float halationAmount = 1.0f;
@@ -236,6 +236,9 @@ struct RenderParams {
   float halationFirstSigmaUmR = 65.0f;
   float halationFirstSigmaUmG = 65.0f;
   float halationFirstSigmaUmB = 65.0f;
+  float halationBoostEv = 0.0f;
+  float halationBoostRange = 0.3f;
+  float halationProtectEv = 4.0f;
 
   bool cameraDiffusionEnabled = false;
   DiffusionFilterFamily cameraDiffusionFamily = DiffusionFilterFamily::BlackProMist;
@@ -267,6 +270,8 @@ struct RenderParams {
   float scannerWhiteLevel = 0.98f;
   float scannerBlackLevel = 0.01f;
   float glarePercent = 0.03f;
+  float glareRoughness = 0.7f;
+  float glareBlur = 0.5f;
   float scannerMtf50LpMm = 60.0f;
   float scannerUnsharpRadiusUm = 5.0f;
   float scannerUnsharpAmount = 0.7f;

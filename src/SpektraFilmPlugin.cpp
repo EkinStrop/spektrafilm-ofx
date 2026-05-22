@@ -1,6 +1,6 @@
-#include "SpektraMetalRenderer.h"
 #include "SpektraParameters.h"
 #include "SpektraProfileCurves.h"
+#include "SpektraRenderer.h"
 #include "SpektraTooltips.h"
 
 #include "ofxImageEffect.h"
@@ -236,6 +236,9 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"halationAmount", "halationGroup", flow()},
   {"halationScale", "halationGroup", flow()},
   {"halationStrength", "halationGroup", flow()},
+  {"halationBoostEv", "halationGroup", flow()},
+  {"halationBoostRange", "halationGroup", kParamTagNone},
+  {"halationProtectEv", "halationGroup", kParamTagNone},
 
   {"cameraDiffusionEnabled", "diffusionGroup", flow()},
   {"cameraDiffusionFamily", "diffusionGroup", flow()},
@@ -266,6 +269,8 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"scannerWhiteLevel", "scannerGroup", flow()},
   {"scannerBlackLevel", "scannerGroup", flow()},
   {"glarePercent", "scannerGroup", kParamTagNone},
+  {"glareRoughness", "scannerGroup", kParamTagNone},
+  {"glareBlur", "scannerGroup", kParamTagNone},
   {"scannerMtf50LpMm", "scannerGroup", kParamTagNone},
   {"scannerUnsharpRadiusUm", "scannerGroup", kParamTagNone},
   {"scannerUnsharpAmount", "scannerGroup", kParamTagNone},
@@ -453,10 +458,10 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("dirDiffusionTailWeight", 0.06),
   doubleDefault("dirInhibitionSameLayer", 1.0),
   doubleDefault("dirInhibitionInterlayer", 1.0),
-  double3DDefault("dirGammaSameLayerRgb", 0.341, 0.324, 0.273),
-  double2DDefault("dirGammaRToGb", 0.355, 0.305),
-  double2DDefault("dirGammaGToRb", 0.154, 0.358),
-  double2DDefault("dirGammaBToRg", 0.171, 0.225),
+  double3DDefault("dirGammaSameLayerRgb", 0.336, 0.319, 0.273),
+  double2DDefault("dirGammaRToGb", 0.353, 0.302),
+  double2DDefault("dirGammaGToRb", 0.154, 0.353),
+  double2DDefault("dirGammaBToRg", 0.168, 0.226),
   boolDefault("dirUsesStockCalibration", true),
 
   boolDefault("grainEnabled", false),
@@ -499,6 +504,9 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("halationAmount", 1.0),
   doubleDefault("halationScale", 1.0),
   double3DDefault("halationStrength", 0.05, 0.015, 0.0),
+  doubleDefault("halationBoostEv", 0.0),
+  doubleDefault("halationBoostRange", 0.3),
+  doubleDefault("halationProtectEv", 4.0),
 
   boolDefault("cameraDiffusionEnabled", false),
   intDefault("cameraDiffusionFamily", 1),
@@ -529,6 +537,8 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("scannerWhiteLevel", 0.98),
   doubleDefault("scannerBlackLevel", 0.01),
   doubleDefault("glarePercent", 0.03),
+  doubleDefault("glareRoughness", 0.7),
+  doubleDefault("glareBlur", 0.5),
   doubleDefault("scannerMtf50LpMm", 60.0),
   doubleDefault("scannerUnsharpRadiusUm", 5.0),
   doubleDefault("scannerUnsharpAmount", 0.7),
@@ -704,6 +714,9 @@ struct InstanceData {
   OfxParamHandle halationAmount = nullptr;
   OfxParamHandle halationScale = nullptr;
   OfxParamHandle halationStrength = nullptr;
+  OfxParamHandle halationBoostEv = nullptr;
+  OfxParamHandle halationBoostRange = nullptr;
+  OfxParamHandle halationProtectEv = nullptr;
   OfxParamHandle cameraDiffusionEnabled = nullptr;
   OfxParamHandle cameraDiffusionFamily = nullptr;
   OfxParamHandle cameraDiffusionStrength = nullptr;
@@ -732,6 +745,8 @@ struct InstanceData {
   OfxParamHandle scannerWhiteLevel = nullptr;
   OfxParamHandle scannerBlackLevel = nullptr;
   OfxParamHandle glarePercent = nullptr;
+  OfxParamHandle glareRoughness = nullptr;
+  OfxParamHandle glareBlur = nullptr;
   OfxParamHandle scannerMtf50LpMm = nullptr;
   OfxParamHandle scannerUnsharpRadiusUm = nullptr;
   OfxParamHandle scannerUnsharpAmount = nullptr;
@@ -745,7 +760,7 @@ struct InstanceData {
   bool syncingPrinterLights = false;
   bool syncingDirCalibration = false;
 
-  std::unique_ptr<spektrafilm::MetalRenderer> renderer;
+  std::unique_ptr<spektrafilm::Renderer> renderer;
 };
 
 InstanceData *getInstanceData(OfxImageEffectHandle effect) {
@@ -1169,7 +1184,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.dirCouplersDiffusionTailWeight = static_cast<float>(getDoubleAtTime(data->dirDiffusionTailWeight, time, 0.06));
   params.dirCouplersInhibitionSameLayer = static_cast<float>(getDoubleAtTime(data->dirInhibitionSameLayer, time, 1.0));
   params.dirCouplersInhibitionInterlayer = static_cast<float>(getDoubleAtTime(data->dirInhibitionInterlayer, time, 1.0));
-  double dirGammaSameLayerRgb[3] = {0.341, 0.324, 0.273};
+  double dirGammaSameLayerRgb[3] = {0.336, 0.319, 0.273};
   if (data->dirGammaSameLayerRgb) {
     gParamHost->paramGetValueAtTime(
       data->dirGammaSameLayerRgb,
@@ -1179,15 +1194,15 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
       &dirGammaSameLayerRgb[2]
     );
   }
-  double dirGammaRToGb[2] = {0.355, 0.305};
+  double dirGammaRToGb[2] = {0.353, 0.302};
   if (data->dirGammaRToGb) {
     gParamHost->paramGetValueAtTime(data->dirGammaRToGb, time, &dirGammaRToGb[0], &dirGammaRToGb[1]);
   }
-  double dirGammaGToRb[2] = {0.154, 0.358};
+  double dirGammaGToRb[2] = {0.154, 0.353};
   if (data->dirGammaGToRb) {
     gParamHost->paramGetValueAtTime(data->dirGammaGToRb, time, &dirGammaGToRb[0], &dirGammaGToRb[1]);
   }
-  double dirGammaBToRg[2] = {0.171, 0.225};
+  double dirGammaBToRg[2] = {0.168, 0.226};
   if (data->dirGammaBToRg) {
     gParamHost->paramGetValueAtTime(data->dirGammaBToRg, time, &dirGammaBToRg[0], &dirGammaBToRg[1]);
   }
@@ -1276,7 +1291,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.grainSynthesisLayerScale1 = static_cast<float>(grainSynthesisLayerScale[1]);
   params.grainSynthesisLayerScale2 = static_cast<float>(grainSynthesisLayerScale[2]);
   params.grainSynthesisLayered = getBoolAtTime(data->grainSynthesisLayered, time, true);
-  params.halationEnabled = getBoolAtTime(data->halationEnabled, time, true);
+  params.halationEnabled = getBoolAtTime(data->halationEnabled, time, false);
   params.scatterAmount = static_cast<float>(getDoubleAtTime(data->scatterAmount, time, 1.0));
   params.scatterScale = static_cast<float>(getDoubleAtTime(data->scatterScale, time, 1.0));
   params.halationAmount = static_cast<float>(getDoubleAtTime(data->halationAmount, time, 1.0));
@@ -1288,6 +1303,9 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.halationStrengthR = static_cast<float>(strength[0]);
   params.halationStrengthG = static_cast<float>(strength[1]);
   params.halationStrengthB = static_cast<float>(strength[2]);
+  params.halationBoostEv = static_cast<float>(getDoubleAtTime(data->halationBoostEv, time, 0.0));
+  params.halationBoostRange = static_cast<float>(getDoubleAtTime(data->halationBoostRange, time, 0.3));
+  params.halationProtectEv = static_cast<float>(getDoubleAtTime(data->halationProtectEv, time, 4.0));
   params.cameraDiffusionEnabled = getBoolAtTime(data->cameraDiffusionEnabled, time, false);
   params.cameraDiffusionFamily = static_cast<spektrafilm::DiffusionFilterFamily>(getIntAtTime(data->cameraDiffusionFamily, time, 1));
   params.cameraDiffusionStrength = static_cast<float>(getDoubleAtTime(data->cameraDiffusionStrength, time, 0.5));
@@ -1316,6 +1334,8 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.scannerWhiteLevel = static_cast<float>(getDoubleAtTime(data->scannerWhiteLevel, time, 0.98));
   params.scannerBlackLevel = static_cast<float>(getDoubleAtTime(data->scannerBlackLevel, time, 0.01));
   params.glarePercent = static_cast<float>(getDoubleAtTime(data->glarePercent, time, 0.03));
+  params.glareRoughness = static_cast<float>(getDoubleAtTime(data->glareRoughness, time, 0.7));
+  params.glareBlur = static_cast<float>(getDoubleAtTime(data->glareBlur, time, 0.5));
   params.scannerMtf50LpMm = static_cast<float>(getDoubleAtTime(data->scannerMtf50LpMm, time, 60.0));
   params.scannerUnsharpRadiusUm = static_cast<float>(getDoubleAtTime(data->scannerUnsharpRadiusUm, time, 5.0));
   params.scannerUnsharpAmount = static_cast<float>(getDoubleAtTime(data->scannerUnsharpAmount, time, 0.7));
@@ -2633,6 +2653,9 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "halationAmount", data->halationAmount);
   cacheParam(paramSet, "halationScale", data->halationScale);
   cacheParam(paramSet, "halationStrength", data->halationStrength);
+  cacheParam(paramSet, "halationBoostEv", data->halationBoostEv);
+  cacheParam(paramSet, "halationBoostRange", data->halationBoostRange);
+  cacheParam(paramSet, "halationProtectEv", data->halationProtectEv);
   cacheParam(paramSet, "cameraDiffusionEnabled", data->cameraDiffusionEnabled);
   cacheParam(paramSet, "cameraDiffusionFamily", data->cameraDiffusionFamily);
   cacheParam(paramSet, "cameraDiffusionStrength", data->cameraDiffusionStrength);
@@ -2661,6 +2684,8 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "scannerWhiteLevel", data->scannerWhiteLevel);
   cacheParam(paramSet, "scannerBlackLevel", data->scannerBlackLevel);
   cacheParam(paramSet, "glarePercent", data->glarePercent);
+  cacheParam(paramSet, "glareRoughness", data->glareRoughness);
+  cacheParam(paramSet, "glareBlur", data->glareBlur);
   cacheParam(paramSet, "scannerMtf50LpMm", data->scannerMtf50LpMm);
   cacheParam(paramSet, "scannerUnsharpRadiusUm", data->scannerUnsharpRadiusUm);
   cacheParam(paramSet, "scannerUnsharpAmount", data->scannerUnsharpAmount);
@@ -2679,7 +2704,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
     applyDirStockCalibration(data, false);
   }
 
-  data->renderer = std::make_unique<spektrafilm::MetalRenderer>();
+  data->renderer = spektrafilm::createNativeRenderer();
   rememberCurrentPrinterLights(data);
   syncConditionalParamVisibility(data);
   gPropHost->propSetPointer(effectProps, kOfxPropInstanceData, 0, data);
@@ -3176,7 +3201,7 @@ int halationRadiusPixels(const spektrafilm::RenderParams &params, double pixelSi
   }
   double maxSigmaUm = 0.0;
   if (params.scatterAmount > 0.0f && params.scatterScale > 0.0f) {
-    constexpr double kMaxScatterTailUm = 8.8;
+    constexpr double kMaxScatterTailUm = 9.7;
     constexpr double kMaxExpGaussianFitSigmaScale = 2.7684;
     maxSigmaUm = std::max(maxSigmaUm, kMaxScatterTailUm * kMaxExpGaussianFitSigmaScale * params.scatterScale);
   }
@@ -3371,7 +3396,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPr
     spektrafilm::RenderParams params = readParams(data, time);
     if (!data->renderer->render(source, output, window, params, time)) {
       if (gMessageHost) {
-        gMessageHost->message(effect, kOfxMessageError, "spektrafilmMetal", "%s", data->renderer->lastError().c_str());
+        gMessageHost->message(effect, kOfxMessageError, "spektrafilmRenderer", "%s", data->renderer->lastError().c_str());
       }
       status = kOfxStatFailed;
     }
@@ -3561,10 +3586,10 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "dirDiffusionTailWeight", "Tail Weight", 0.06, 0.0, 1.0, "couplerGroup");
   defineDouble(paramSet, "dirInhibitionSameLayer", "Same-Layer Inhibition", 1.0, 0.0, 2.0, "couplerGroup");
   defineDouble(paramSet, "dirInhibitionInterlayer", "Interlayer Inhibition", 1.0, 0.0, 2.0, "couplerGroup");
-  defineDouble3DRange(paramSet, "dirGammaSameLayerRgb", "Same-Layer Gamma RGB", 0.341, 0.324, 0.273, 0.0, 1.0, "couplerGroup");
-  defineDouble2DRange(paramSet, "dirGammaRToGb", "R -> G/B Gamma", 0.355, 0.305, 0.0, 1.0, "couplerGroup");
-  defineDouble2DRange(paramSet, "dirGammaGToRb", "G -> R/B Gamma", 0.154, 0.358, 0.0, 1.0, "couplerGroup");
-  defineDouble2DRange(paramSet, "dirGammaBToRg", "B -> R/G Gamma", 0.171, 0.225, 0.0, 1.0, "couplerGroup");
+  defineDouble3DRange(paramSet, "dirGammaSameLayerRgb", "Same-Layer Gamma RGB", 0.336, 0.319, 0.273, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaRToGb", "R -> G/B Gamma", 0.353, 0.302, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaGToRb", "G -> R/B Gamma", 0.154, 0.353, 0.0, 1.0, "couplerGroup");
+  defineDouble2DRange(paramSet, "dirGammaBToRg", "B -> R/G Gamma", 0.168, 0.226, 0.0, 1.0, "couplerGroup");
   definePushButton(paramSet, "dirCalibrateToStock", "Calibrate to Stock", "couplerGroup");
   defineHiddenBool(paramSet, "dirUsesStockCalibration", true);
   defineBool(paramSet, "grainEnabled", "Enabled", false, "grainGroup");
@@ -3605,6 +3630,9 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "halationAmount", "Amount", 1.0, 0.0, 4.0, "halationGroup");
   defineDouble(paramSet, "halationScale", "Scale", 1.0, 0.0, 4.0, "halationGroup");
   defineRGB(paramSet, "halationStrength", "Strength RGB", 0.05, 0.015, 0.0, "halationGroup");
+  defineDouble(paramSet, "halationBoostEv", "Boost EV", 0.0, 0.0, 20.0, "halationGroup");
+  defineDouble(paramSet, "halationBoostRange", "Boost Range", 0.3, 0.0, 1.0, "halationGroup");
+  defineDouble(paramSet, "halationProtectEv", "Protect EV", 4.0, 0.0, 10.0, "halationGroup");
   const char *diffusionFamilies[] = {"Glimmerglass", "Black Pro-Mist", "Pro-Mist", "CineBloom"};
   defineBool(paramSet, "cameraDiffusionEnabled", "Camera Enabled", false, "diffusionGroup");
   defineChoice(paramSet, "cameraDiffusionFamily", "Camera Family", diffusionFamilies, 4, 1, "diffusionGroup");
@@ -3634,6 +3662,8 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "scannerWhiteLevel", "White Level", 0.98, 0.0, 1.0, "scannerGroup");
   defineDouble(paramSet, "scannerBlackLevel", "Black Level", 0.01, 0.0, 1.0, "scannerGroup");
   defineDouble(paramSet, "glarePercent", "Glare Percent", 0.03, 0.0, 0.2, "scannerGroup");
+  defineDouble(paramSet, "glareRoughness", "Glare Roughness", 0.7, 0.0, 4.0, "scannerGroup");
+  defineDouble(paramSet, "glareBlur", "Glare Blur", 0.5, 0.0, 32.0, "scannerGroup");
   defineDouble(paramSet, "scannerMtf50LpMm", "MTF50 lp/mm", 60.0, 0.0, 300.0, "scannerGroup");
   defineDouble(paramSet, "scannerUnsharpRadiusUm", "Unsharp Radius um", 5.0, 0.0, 100.0, "scannerGroup");
   defineDouble(paramSet, "scannerUnsharpAmount", "Unsharp Amount", 0.7, 0.0, 4.0, "scannerGroup");

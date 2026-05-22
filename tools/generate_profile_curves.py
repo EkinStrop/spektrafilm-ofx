@@ -673,10 +673,10 @@ def _dir_coupler_defaults(info: dict) -> dict[str, tuple[float, ...]]:
         }
     else:
         defaults = {
-            "same_layer_rgb": (0.341, 0.324, 0.273),
-            "r_to_gb": (0.355, 0.305),
-            "g_to_rb": (0.154, 0.358),
-            "b_to_rg": (0.171, 0.225),
+            "same_layer_rgb": (0.336, 0.319, 0.273),
+            "r_to_gb": (0.353, 0.302),
+            "g_to_rb": (0.154, 0.353),
+            "b_to_rg": (0.168, 0.226),
         }
 
     stock = info["stock"]

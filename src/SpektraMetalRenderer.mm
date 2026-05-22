@@ -231,6 +231,10 @@ struct KernelParams {
   float halationFirstSigmaUmR;
   float halationFirstSigmaUmG;
   float halationFirstSigmaUmB;
+  float halationBoostEv;
+  float halationBoostRange;
+  float halationProtectEv;
+  float _padHalation0;
   uint32_t cameraDiffusionEnabled;
   int32_t cameraDiffusionFamily;
   float cameraDiffusionStrength;
@@ -259,6 +263,8 @@ struct KernelParams {
   float scannerWhiteLevel;
   float scannerBlackLevel;
   float glarePercent;
+  float glareRoughness;
+  float glareBlur;
   float scannerBlurSigmaPx;
   float scannerUnsharpSigmaPx;
   float scannerUnsharpAmount;
@@ -936,6 +942,9 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.halationFirstSigmaUmR = params.halationFirstSigmaUmR;
   out.halationFirstSigmaUmG = params.halationFirstSigmaUmG;
   out.halationFirstSigmaUmB = params.halationFirstSigmaUmB;
+  out.halationBoostEv = params.halationBoostEv;
+  out.halationBoostRange = params.halationBoostRange;
+  out.halationProtectEv = params.halationProtectEv;
   out.cameraDiffusionEnabled = params.cameraDiffusionEnabled ? 1u : 0u;
   out.cameraDiffusionFamily = static_cast<int32_t>(params.cameraDiffusionFamily);
   out.cameraDiffusionStrength = params.cameraDiffusionStrength;
@@ -964,6 +973,8 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.scannerWhiteLevel = params.scannerWhiteLevel;
   out.scannerBlackLevel = params.scannerBlackLevel;
   out.glarePercent = params.glarePercent;
+  out.glareRoughness = params.glareRoughness;
+  out.glareBlur = params.glareBlur;
   out.scannerBlurSigmaPx = scannerSigmaUmFromMtf50(params.scannerMtf50LpMm) / std::max(out.filmPixelSizeUm, 1.0e-6f);
   out.scannerUnsharpSigmaPx = std::max(params.scannerUnsharpRadiusUm, 0.0f) / std::max(out.filmPixelSizeUm, 1.0e-6f);
   out.scannerUnsharpAmount = params.scannerUnsharpAmount;
@@ -1285,6 +1296,9 @@ std::vector<float> applyCameraBandPass(
 
   constexpr float kPythonUvTransitionNm = 8.0f;
   constexpr float kPythonIrTransitionNm = 15.0f;
+  std::array<float, 3> numerator = {0.0f, 0.0f, 0.0f};
+  std::array<float, 3> denominator = {0.0f, 0.0f, 0.0f};
+  std::vector<float> transmissionByWavelength(filmCurves.wavelengthCount, 1.0f);
   for (uint32_t wavelength = 0; wavelength < filmCurves.wavelengthCount; ++wavelength) {
     const float wl = filmCurves.wavelengths[wavelength];
     const float uvTransmission = params.cameraUvFilterEnabled
@@ -1294,10 +1308,26 @@ std::vector<float> applyCameraBandPass(
       ? smoothErfEdge(wl, params.cameraIrCutNm, -kPythonIrTransitionNm)
       : 1.0f;
     const float transmission = uvTransmission * irTransmission;
+    transmissionByWavelength[wavelength] = transmission;
     const uint32_t offset = wavelength * 3u;
-    filtered[offset] *= transmission;
-    filtered[offset + 1u] *= transmission;
-    filtered[offset + 2u] *= transmission;
+    const float illuminant = filmCurves.referenceIlluminantSpectrum ? filmCurves.referenceIlluminantSpectrum[wavelength] : 1.0f;
+    for (uint32_t channel = 0; channel < 3u; ++channel) {
+      const float response = linearSensitivity[offset + channel] * illuminant;
+      denominator[channel] += response;
+      numerator[channel] += response * transmission;
+    }
+  }
+
+  std::array<float, 3> normalization = {1.0f, 1.0f, 1.0f};
+  for (uint32_t channel = 0; channel < 3u; ++channel) {
+    normalization[channel] = numerator[channel] / std::max(denominator[channel], 1.0e-10f);
+    normalization[channel] = std::max(normalization[channel], 1.0e-10f);
+  }
+  for (uint32_t wavelength = 0; wavelength < filmCurves.wavelengthCount; ++wavelength) {
+    const uint32_t offset = wavelength * 3u;
+    for (uint32_t channel = 0; channel < 3u; ++channel) {
+      filtered[offset + channel] *= transmissionByWavelength[wavelength] / normalization[channel];
+    }
   }
   return filtered;
 }
@@ -1325,20 +1355,10 @@ std::array<float, 9> makeMallettRawMatrixUnnormalized(
 
 std::array<float, 9> makeMallettRawMatrix(
   const ProfileCurveSet &filmCurves,
-  const std::vector<float> &linearSensitivity,
-  const std::vector<float> &unfilteredLinearSensitivity,
-  bool cameraFilterActive
+  const std::vector<float> &linearSensitivity
 ) {
   std::array<float, 9> matrix = makeMallettRawMatrixUnnormalized(filmCurves, linearSensitivity);
   float normalization = std::max(filmCurves.mallettRawMidgrayGreen, 1.0e-10f);
-  if (cameraFilterActive) {
-    const std::array<float, 9> unfilteredMatrix =
-      makeMallettRawMatrixUnnormalized(filmCurves, unfilteredLinearSensitivity);
-    constexpr float kMidgray = 0.184f;
-    const float filteredGreenMidgrayProxy = kMidgray * (matrix[3] + matrix[4] + matrix[5]);
-    const float unfilteredGreenMidgrayProxy = kMidgray * (unfilteredMatrix[3] + unfilteredMatrix[4] + unfilteredMatrix[5]);
-    normalization *= filteredGreenMidgrayProxy / std::max(unfilteredGreenMidgrayProxy, 1.0e-10f);
-  }
   normalization = std::max(normalization, 1.0e-10f);
   for (float &value : matrix) {
     value /= normalization;
@@ -1847,6 +1867,9 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> enlargerResamplePipeline = nil;
   id<MTLComputePipelineState> grainPipeline = nil;
   id<MTLComputePipelineState> halationRawExposurePipeline = nil;
+  id<MTLComputePipelineState> halationBoostMaxPipeline = nil;
+  id<MTLComputePipelineState> halationBoostReduceMaxPipeline = nil;
+  id<MTLComputePipelineState> halationBoostApplyPipeline = nil;
   id<MTLComputePipelineState> halationScatterCoreBlurXPipeline = nil;
   id<MTLComputePipelineState> halationScatterCoreBlurYPipeline = nil;
   id<MTLComputePipelineState> halationScatterTailBlurXPipeline = nil;
@@ -1909,6 +1932,10 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> finalFromFilmDensityPipeline = nil;
   id<MTLComputePipelineState> printRawFromFilmDensityPipeline = nil;
   id<MTLComputePipelineState> finalFromPrintRawPipeline = nil;
+  id<MTLComputePipelineState> printGlareGeneratePipeline = nil;
+  id<MTLComputePipelineState> printGlareBlurXPipeline = nil;
+  id<MTLComputePipelineState> printGlareBlurYPipeline = nil;
+  id<MTLComputePipelineState> printGlareApplyPipeline = nil;
   id<MTLComputePipelineState> scannerBlurXPipeline = nil;
   id<MTLComputePipelineState> scannerBlurYPipeline = nil;
   id<MTLComputePipelineState> unsharpBlurXPipeline = nil;
@@ -2237,12 +2264,9 @@ struct MetalRenderer::Impl {
     const std::vector<float> baseFilmSensitivityLinear = makeLinearSensitivity(filmCurves->logSensitivity, filmCurves->wavelengthCount);
     const std::vector<float> filmSensitivityLinear = applyCameraBandPass(*filmCurves, baseFilmSensitivityLinear, params);
     const std::vector<float> paperSensitivityLinear = makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
-    const bool cameraFilterActive = params.cameraUvFilterEnabled || params.cameraIrFilterEnabled;
     const std::array<float, 9> mallettRawMatrix = makeMallettRawMatrix(
       *filmCurves,
-      filmSensitivityLinear,
-      baseFilmSensitivityLinear,
-      cameraFilterActive
+      filmSensitivityLinear
     );
     const std::vector<float> hanatosRawResponse = makeHanatosRawResponse(
       *filmCurves,
@@ -2438,6 +2462,9 @@ struct MetalRenderer::Impl {
       enlargerResamplePipeline = makePipeline(@"spektrafilm_enlarger_resample");
       grainPipeline = makePipeline(@"spektrafilm_grain_preview");
       halationRawExposurePipeline = makePipeline(@"spektrafilm_halation_raw_exposure");
+      halationBoostMaxPipeline = makePipeline(@"spektrafilm_halation_boost_max");
+      halationBoostReduceMaxPipeline = makePipeline(@"spektrafilm_halation_boost_reduce_max");
+      halationBoostApplyPipeline = makePipeline(@"spektrafilm_halation_boost_apply");
       halationScatterCoreBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_core_blur_x");
       halationScatterCoreBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_core_blur_y");
       halationScatterTailBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_blur_x");
@@ -2500,6 +2527,10 @@ struct MetalRenderer::Impl {
       finalFromFilmDensityPipeline = makePipeline(@"spektrafilm_final_from_film_density");
       printRawFromFilmDensityPipeline = makePipeline(@"spektrafilm_print_raw_from_film_density");
       finalFromPrintRawPipeline = makePipeline(@"spektrafilm_final_from_print_raw");
+      printGlareGeneratePipeline = makePipeline(@"spektrafilm_print_glare_generate");
+      printGlareBlurXPipeline = makePipeline(@"spektrafilm_print_glare_blur_x");
+      printGlareBlurYPipeline = makePipeline(@"spektrafilm_print_glare_blur_y");
+      printGlareApplyPipeline = makePipeline(@"spektrafilm_print_glare_apply");
       scannerBlurXPipeline = makePipeline(@"spektrafilm_scanner_blur_x");
       scannerBlurYPipeline = makePipeline(@"spektrafilm_scanner_blur_y");
       unsharpBlurXPipeline = makePipeline(@"spektrafilm_unsharp_blur_x");
@@ -2513,7 +2544,8 @@ struct MetalRenderer::Impl {
       scannerFinalizePipeline = makePipeline(@"spektrafilm_scanner_finalize");
       scannerFinalizeTexturePipeline = makePipeline(@"spektrafilm_scanner_finalize_texture");
       if (!enlargerResamplePipeline ||
-          !grainPipeline || !halationRawExposurePipeline || !halationScatterCoreBlurXPipeline ||
+          !grainPipeline || !halationRawExposurePipeline || !halationBoostMaxPipeline ||
+          !halationBoostReduceMaxPipeline || !halationBoostApplyPipeline || !halationScatterCoreBlurXPipeline ||
           !halationScatterCoreBlurYPipeline || !halationScatterTailBlurXPipeline || !halationScatterTailBlurYPipeline ||
           !halationScatterResolvePipeline || !halationClearPipeline || !halationBounceBlurXPipeline ||
           !halationBounceBlurYAccumulatePipeline || !halationResolveLogRawPipeline || !halationResolveDensityPipeline ||
@@ -2546,6 +2578,8 @@ struct MetalRenderer::Impl {
           !grainSynthesisResolveDensityPipeline ||
           !frameConstantsPipeline || !finalFromFilmDensityPipeline ||
           !printRawFromFilmDensityPipeline || !finalFromPrintRawPipeline ||
+          !printGlareGeneratePipeline || !printGlareBlurXPipeline || !printGlareBlurYPipeline ||
+          !printGlareApplyPipeline ||
           !scannerBlurXPipeline || !scannerBlurYPipeline || !unsharpBlurXPipeline || !unsharpBlurYPipeline ||
           !bufferToTexturePipeline || !textureToBufferPipeline || !scannerBlurXTexturePipeline ||
           !scannerBlurYTexturePipeline || !unsharpBlurXTexturePipeline || !unsharpBlurYTexturePipeline ||
@@ -2636,6 +2670,10 @@ const MetalRenderDiagnostics &MetalRenderer::lastDiagnostics() const {
   return impl_ ? impl_->diagnostics : empty;
 }
 
+std::unique_ptr<Renderer> createNativeRenderer() {
+  return std::make_unique<MetalRenderer>();
+}
+
 bool MetalRenderer::render(
   const ImageView &source,
   const MutableImageView &destination,
@@ -2698,6 +2736,10 @@ bool MetalRenderer::render(
       params.halationEnabled &&
       needsHalationLogRawPath &&
       (params.scatterAmount > 0.0f || params.halationAmount > 0.0f);
+    const bool halationBoostPath =
+      params.halationEnabled &&
+      params.halationBoostEv > 0.0f &&
+      needsFilmDensityPath;
     const bool dirPath = params.dirCouplersAmount > 0.0f && needsFilmDensityPath;
     const bool dirTailPath =
       dirPath &&
@@ -2744,7 +2786,7 @@ bool MetalRenderer::render(
     const bool printDiffusionPath = printDiffusionRequested && printDiffusionInfo.componentCount > 0u && !printDiffusionComponents.empty();
     const bool sourceTransformPath = enlargerTransformActive(params);
     const bool preExposurePath =
-      cameraDiffusionPath || halationPath || printDiffusionPath || finalPostProcessPath ||
+      halationBoostPath || cameraDiffusionPath || halationPath || printDiffusionPath || finalPostProcessPath ||
       densityOutput || densityWithGrainOutput;
     impl_->diagnostics.halationPath = halationPath;
     impl_->diagnostics.cameraDiffusionPath = cameraDiffusionPath;
@@ -2820,13 +2862,19 @@ bool MetalRenderer::render(
     id<MTLBuffer> paramBuffer = impl_->sharedScratchBuffer(sizeof(KernelParams), "kernel params");
     id<MTLBuffer> enlargedSourceBuffer = sourceTransformPath ? impl_->gpuScratchBuffer(bufferBytes, "enlarger source") : nil;
 
+    const bool printGlarePath = finalPrintSimulation && params.scannerEnabled && params.glarePercent > 0.0f;
     const bool scannerNeedsBlur = finalPostProcessPath && params.scannerEnabled && params.scannerMtf50LpMm > 0.0f;
     const bool scannerNeedsUnsharp = finalPostProcessPath && params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f;
     const bool scannerTexturePath = impl_->useScannerTextures && (scannerNeedsBlur || scannerNeedsUnsharp);
-    const bool directFinalEncodePath = finalPostProcessPath && !scannerNeedsBlur && !scannerNeedsUnsharp;
+    const bool directFinalEncodePath = finalPostProcessPath && !printGlarePath && !scannerNeedsBlur && !scannerNeedsUnsharp;
     impl_->diagnostics.scannerTextureIntermediates = scannerTexturePath;
     const bool needsFrameConstants = needsFilmDensityPath || printDiffusionPath;
     const NSUInteger diffusionTempBytes = bufferBytes * static_cast<NSUInteger>(std::max(impl_->diffusionGroupSize, 1u));
+    constexpr uint32_t kHalationBoostMaxChunkPixels = 256u;
+    const uint32_t halationBoostMaxChunkCount = halationBoostPath
+      ? static_cast<uint32_t>((static_cast<uint64_t>(width) * static_cast<uint64_t>(height) +
+          kHalationBoostMaxChunkPixels - 1u) / kHalationBoostMaxChunkPixels)
+      : 0u;
     id<MTLBuffer> frameConstantsBuffer = needsFrameConstants ? impl_->gpuScratchBuffer(sizeof(float) * 16u, "frame constants") : nil;
     id<MTLBuffer> scannerRgbBufferA = (finalPostProcessPath && !directFinalEncodePath) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb A") : nil;
     id<MTLBuffer> scannerRgbBufferB = (!scannerTexturePath && (scannerNeedsBlur || scannerNeedsUnsharp)) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb B") : nil;
@@ -2834,6 +2882,8 @@ bool MetalRenderer::render(
     id<MTLTexture> scannerTextureA = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture A") : nil;
     id<MTLTexture> scannerTextureB = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture B") : nil;
     id<MTLTexture> scannerTextureC = (scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchTexture(width, height, "scanner texture C") : nil;
+    id<MTLBuffer> printGlareBufferA = printGlarePath ? impl_->gpuScratchBuffer(bufferBytes, "print glare A") : nil;
+    id<MTLBuffer> printGlareBufferB = printGlarePath ? impl_->gpuScratchBuffer(bufferBytes, "print glare B") : nil;
     id<MTLBuffer> halationRawBufferA = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw A") : nil;
     id<MTLBuffer> halationRawBufferB = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw B") : nil;
     id<MTLBuffer> halationRawBufferC = preExposurePath ? impl_->gpuScratchBuffer(cameraDiffusionPath ? diffusionTempBytes : bufferBytes, "pre-exposure raw C") : nil;
@@ -2841,6 +2891,9 @@ bool MetalRenderer::render(
     id<MTLBuffer> halationLogRawBuffer = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure log raw") : nil;
     id<MTLBuffer> halationDensityBufferA = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density A") : nil;
     id<MTLBuffer> halationDensityBufferB = (preExposurePath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density B") : nil;
+    id<MTLBuffer> halationBoostMaxBuffer = halationBoostPath
+      ? impl_->gpuScratchBuffer(static_cast<NSUInteger>(std::max(halationBoostMaxChunkCount, 4u)) * sizeof(float), "halation boost max")
+      : nil;
     id<MTLBuffer> cameraDiffusionInfoBuffer = cameraDiffusionPath ? impl_->sharedScratchBuffer(sizeof(KernelDiffusionInfo), "camera diffusion info") : nil;
     id<MTLBuffer> cameraDiffusionComponentsBuffer = cameraDiffusionPath && !cameraDiffusionComponents.empty()
       ? impl_->sharedScratchBuffer(cameraDiffusionComponents.size() * sizeof(KernelDiffusionComponent), "camera diffusion components")
@@ -2933,6 +2986,10 @@ bool MetalRenderer::render(
       impl_->lastError = "Unable to allocate camera diffusion Metal buffers.";
       return false;
     }
+    if (halationBoostPath && !halationBoostMaxBuffer) {
+      impl_->lastError = "Unable to allocate halation highlight boost Metal buffers.";
+      return false;
+    }
     if (printDiffusionPath && (!printDiffusionInfoBuffer || !printDiffusionComponentsBuffer ||
         !printRawBufferA || !printRawBufferB || !printRawBufferC)) {
       impl_->lastError = "Unable to allocate print diffusion Metal buffers.";
@@ -2940,6 +2997,10 @@ bool MetalRenderer::render(
     }
     if (finalPostProcessPath && !directFinalEncodePath && !scannerRgbBufferA) {
       impl_->lastError = "Unable to allocate scanner post-process Metal buffers.";
+      return false;
+    }
+    if (printGlarePath && (!printGlareBufferA || !printGlareBufferB)) {
+      impl_->lastError = "Unable to allocate print glare Metal buffers.";
       return false;
     }
     if (!scannerTexturePath && (scannerNeedsBlur || scannerNeedsUnsharp) && !scannerRgbBufferB) {
@@ -3219,7 +3280,46 @@ bool MetalRenderer::render(
       dispatch1D(impl_->frameConstantsPipeline, 1u, sizeof(float) * 16u);
     }
 
+    auto encodePrintGlare = [&](id<MTLBuffer> linearRgbBuffer) -> id<MTLBuffer> {
+      if (!printGlarePath) {
+        return linearRgbBuffer;
+      }
+      [encoder setComputePipelineState:impl_->printGlareGeneratePipeline];
+      [encoder setBuffer:printGlareBufferA offset:0 atIndex:0];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(impl_->printGlareGeneratePipeline);
+
+      id<MTLBuffer> amountBuffer = printGlareBufferA;
+      if (params.glareBlur > 0.0f) {
+        [encoder setComputePipelineState:impl_->printGlareBlurXPipeline];
+        [encoder setBuffer:printGlareBufferA offset:0 atIndex:0];
+        [encoder setBuffer:printGlareBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->printGlareBlurXPipeline);
+
+        [encoder setComputePipelineState:impl_->printGlareBlurYPipeline];
+        [encoder setBuffer:printGlareBufferB offset:0 atIndex:0];
+        [encoder setBuffer:printGlareBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        dispatch2D(impl_->printGlareBlurYPipeline);
+        amountBuffer = printGlareBufferA;
+      }
+
+      [encoder setComputePipelineState:impl_->printGlareApplyPipeline];
+      [encoder setBuffer:linearRgbBuffer offset:0 atIndex:0];
+      [encoder setBuffer:amountBuffer offset:0 atIndex:1];
+      [encoder setBuffer:printGlareBufferB offset:0 atIndex:2];
+      [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:3];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+      dispatch2D(impl_->printGlareApplyPipeline);
+      return printGlareBufferB;
+    };
+
     auto encodeScannerPostProcess = [&](id<MTLBuffer> linearRgbBuffer) {
+      linearRgbBuffer = encodePrintGlare(linearRgbBuffer);
       if (scannerTexturePath) {
         [encoder setComputePipelineState:impl_->bufferToTexturePipeline];
         [encoder setBuffer:linearRgbBuffer offset:0 atIndex:0];
@@ -3786,17 +3886,46 @@ bool MetalRenderer::render(
       dispatch2D(impl_->halationRawExposurePipeline);
 
       id<MTLBuffer> currentRawBuffer = halationRawBufferA;
+      if (halationBoostPath) {
+        [encoder setComputePipelineState:impl_->halationBoostMaxPipeline];
+        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:halationBoostMaxBuffer offset:0 atIndex:1];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+        [encoder setBytes:&kHalationBoostMaxChunkPixels length:sizeof(kHalationBoostMaxChunkPixels) atIndex:3];
+        dispatch1D(impl_->halationBoostMaxPipeline, halationBoostMaxChunkCount, bufferBytes);
+
+        [encoder setComputePipelineState:impl_->halationBoostReduceMaxPipeline];
+        [encoder setBuffer:halationBoostMaxBuffer offset:0 atIndex:0];
+        [encoder setBuffer:halationBoostMaxBuffer offset:0 atIndex:1];
+        [encoder setBytes:&halationBoostMaxChunkCount length:sizeof(halationBoostMaxChunkCount) atIndex:2];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+        dispatch1D(
+          impl_->halationBoostReduceMaxPipeline,
+          1u,
+          static_cast<uint64_t>(std::max(halationBoostMaxChunkCount, 1u)) * sizeof(float)
+        );
+
+        [encoder setComputePipelineState:impl_->halationBoostApplyPipeline];
+        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:halationRawBufferB offset:0 atIndex:1];
+        [encoder setBuffer:halationBoostMaxBuffer offset:0 atIndex:2];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+        dispatch2D(impl_->halationBoostApplyPipeline);
+        currentRawBuffer = halationRawBufferB;
+      }
       if (cameraDiffusionPath) {
+        id<MTLBuffer> diffusionDestinationBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
         encodeDiffusion(
-          halationRawBufferA,
-          halationRawBufferB,
+          currentRawBuffer,
+          diffusionDestinationBuffer,
           halationRawBufferC,
           halationRawBufferD,
           cameraDiffusionInfoBuffer,
           cameraDiffusionComponentsBuffer,
           cameraDiffusionInfo.componentCount
         );
-        currentRawBuffer = halationRawBufferB;
+        currentRawBuffer = diffusionDestinationBuffer;
       }
 
       if (halationPath && params.scatterAmount > 0.0f && params.scatterScale > 0.0f) {

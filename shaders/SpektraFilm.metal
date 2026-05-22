@@ -110,6 +110,10 @@ struct SpektraKernelParams {
   float halationFirstSigmaUmR;
   float halationFirstSigmaUmG;
   float halationFirstSigmaUmB;
+  float halationBoostEv;
+  float halationBoostRange;
+  float halationProtectEv;
+  float _padHalation0;
   uint cameraDiffusionEnabled;
   int cameraDiffusionFamily;
   float cameraDiffusionStrength;
@@ -138,6 +142,8 @@ struct SpektraKernelParams {
   float scannerWhiteLevel;
   float scannerBlackLevel;
   float glarePercent;
+  float glareRoughness;
+  float glareBlur;
   float scannerBlurSigmaPx;
   float scannerUnsharpSigmaPx;
   float scannerUnsharpAmount;
@@ -2986,12 +2992,12 @@ static float spektra_dir_tail_amplitude(uint component) {
 }
 
 static float3 spektra_halation_scatter_core_sigma(constant SpektraKernelParams &params) {
-  constexpr float3 kScatterCoreUm = float3(2.6, 2.3, 1.8);
+  constexpr float3 kScatterCoreUm = float3(2.2, 2.0, 1.6);
   return kScatterCoreUm * max(params.scatterScale, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
 }
 
 static float3 spektra_halation_scatter_tail_sigma(constant SpektraKernelParams &params, uint component) {
-  constexpr float3 kScatterTailUm = float3(8.8, 7.0, 6.4);
+  constexpr float3 kScatterTailUm = float3(9.3, 9.7, 9.1);
   const float ratio = component == 0u ? 0.5360 : (component == 1u ? 1.5236 : 2.7684);
   return kScatterTailUm * ratio * max(params.scatterScale, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
 }
@@ -3114,6 +3120,109 @@ kernel void spektrafilm_halation_raw_exposure(
   );
 }
 
+kernel void spektrafilm_halation_boost_max(
+  device const float4 *rawIn [[buffer(0)]],
+  device float *maxOut [[buffer(1)]],
+  constant uint2 &dims [[buffer(2)]],
+  constant uint &chunkPixels [[buffer(3)]],
+  uint tid [[thread_position_in_grid]]
+) {
+  const uint count = dims.x * dims.y;
+  const uint start = tid * chunkPixels;
+  if (start >= count) {
+    return;
+  }
+  const uint end = min(start + chunkPixels, count);
+  float maxRaw = 0.0;
+  for (uint index = start; index < end; ++index) {
+    maxRaw = max(maxRaw, spektra_max3(rawIn[index].rgb));
+  }
+  maxOut[tid] = maxRaw;
+}
+
+kernel void spektrafilm_halation_boost_reduce_max(
+  device const float *chunkMaxIn [[buffer(0)]],
+  device float *boostInfoOut [[buffer(1)]],
+  constant uint &chunkCount [[buffer(2)]],
+  constant SpektraKernelParams &params [[buffer(3)]],
+  uint tid [[thread_position_in_grid]]
+) {
+  if (tid != 0u) {
+    return;
+  }
+  float maxRaw = 0.0;
+  for (uint index = 0u; index < chunkCount; ++index) {
+    maxRaw = max(maxRaw, chunkMaxIn[index]);
+  }
+  constexpr float kMidgray = 0.184;
+  const float rawX0 = clamp(kMidgray * exp2(params.halationProtectEv), 0.0, maxRaw);
+  const float boostRange = clamp(params.halationBoostRange, 0.0, 1.0);
+  const float a = pow(28.0, 1.0 - boostRange);
+  const float x0 = maxRaw > 0.0 ? rawX0 / maxRaw : 1.0;
+  const float denom = exp(a * (1.0 - x0)) - a * (1.0 - x0) - 1.0;
+  const float k = (maxRaw > 0.0 && rawX0 < maxRaw && denom > 1.0e-10)
+    ? (exp2(max(params.halationBoostEv, 0.0)) - 1.0) / denom
+    : 0.0;
+  boostInfoOut[0] = maxRaw;
+  boostInfoOut[1] = rawX0;
+  boostInfoOut[2] = a;
+  boostInfoOut[3] = k;
+}
+
+static float spektra_halation_boost_channel(
+  float value,
+  float rawX0,
+  float maxRaw,
+  float a,
+  float k
+) {
+  if (value <= rawX0) {
+    return value;
+  }
+  const float dx = (value - rawX0) / maxRaw;
+  const float boost = k * maxRaw * (exp(a * dx) - a * dx - 1.0);
+  return value + boost;
+}
+
+kernel void spektrafilm_halation_boost_apply(
+  device const float4 *rawIn [[buffer(0)]],
+  device float4 *rawOut [[buffer(1)]],
+  device const float *boostInfo [[buffer(2)]],
+  constant SpektraKernelParams &params [[buffer(3)]],
+  constant uint2 &dims [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float4 raw = rawIn[index];
+  if (params.halationEnabled == 0u || params.halationBoostEv <= 0.0) {
+    rawOut[index] = raw;
+    return;
+  }
+  const float frameMax = boostInfo[0];
+  const float rawX0 = boostInfo[1];
+  const float a = boostInfo[2];
+  const float k = boostInfo[3];
+  if (frameMax <= 0.0 || k <= 0.0) {
+    rawOut[index] = raw;
+    return;
+  }
+  if (rawX0 >= frameMax || spektra_max3(raw.rgb) <= rawX0) {
+    rawOut[index] = raw;
+    return;
+  }
+  rawOut[index] = float4(
+    float3(
+      spektra_halation_boost_channel(raw.r, rawX0, frameMax, a, k),
+      spektra_halation_boost_channel(raw.g, rawX0, frameMax, a, k),
+      spektra_halation_boost_channel(raw.b, rawX0, frameMax, a, k)
+    ),
+    raw.a
+  );
+}
+
 kernel void spektrafilm_halation_scatter_core_blur_x(
   device const float4 *rawIn [[buffer(0)]],
   device float4 *rawOut [[buffer(1)]],
@@ -3186,7 +3295,7 @@ kernel void spektrafilm_halation_scatter_resolve(
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
-  constexpr float3 kScatterTailWeight = float3(0.74, 0.64, 0.64);
+  constexpr float3 kScatterTailWeight = float3(0.78, 0.65, 0.67);
   const uint index = gid.y * dims.x + gid.x;
   const float4 raw = rawIn[index];
   const float3 scattered = (1.0 - kScatterTailWeight) * coreIn[index].rgb + kScatterTailWeight * tailIn[index].rgb;
@@ -5160,9 +5269,6 @@ kernel void spektrafilm_final_from_film_density(
       frameConstants.print.z,
       params
     );
-    if (params.scannerEnabled != 0u && params.glarePercent > 0.0) {
-      pixel.rgb += (params.glarePercent / 100.0) * frameConstants.glare.rgb;
-    }
   } else if (finalScanNegative) {
     const float3 filmDensityCmy = pixel.rgb;
     const float3 bypassedFilmDensityCmy = spektra_negative_bleach_bypass_dye_density(
@@ -5322,9 +5428,6 @@ kernel void spektrafilm_final_from_print_raw(
     frameConstants.print.z,
     params
   );
-  if (params.scannerEnabled != 0u && params.glarePercent > 0.0) {
-    pixel.rgb += (params.glarePercent / 100.0) * frameConstants.glare.rgb;
-  }
   if (encodeOutput != 0u) {
     pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
   }
@@ -5371,6 +5474,96 @@ static float4 spektra_rgb_gaussian_sample_y(
     weightSum += weight;
   }
   return value / max(weightSum, 1.0e-8);
+}
+
+static float spektra_hash_01(uint2 p, uint seed) {
+  uint x = p.x * 1664525u + p.y * 1013904223u + seed * 747796405u + 2891336453u;
+  x ^= x >> 16u;
+  x *= 2246822519u;
+  x ^= x >> 13u;
+  x *= 3266489917u;
+  x ^= x >> 16u;
+  return (float(x & 0x00ffffffu) + 0.5) / 16777216.0;
+}
+
+static float spektra_lognormal_from_mean_std(float mean, float stddev, uint2 gid, uint seed) {
+  mean = max(mean, 0.0);
+  stddev = max(stddev, 0.0);
+  if (mean <= 0.0) {
+    return 0.0;
+  }
+  if (stddev <= 1.0e-10) {
+    return mean;
+  }
+  const float varianceRatio = (stddev * stddev) / max(mean * mean, 1.0e-20);
+  const float sigma2 = log(1.0 + varianceRatio);
+  const float sigma = sqrt(max(sigma2, 0.0));
+  const float mu = log(mean) - 0.5 * sigma2;
+  const float u1 = max(spektra_hash_01(gid, seed), 1.0e-7);
+  const float u2 = spektra_hash_01(uint2(gid.y, gid.x), seed ^ 0x9e3779b9u);
+  const float normal = sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+  return exp(mu + sigma * normal);
+}
+
+kernel void spektrafilm_print_glare_generate(
+  device float4 *glareOut [[buffer(0)]],
+  constant SpektraKernelParams &params [[buffer(1)]],
+  constant uint2 &dims [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float mean = max(params.glarePercent, 0.0);
+  const float stddev = max(params.glareRoughness, 0.0) * mean;
+  const float amount = spektra_lognormal_from_mean_std(mean, stddev, gid, params.grainSeed);
+  glareOut[index] = float4(amount, amount, amount, 1.0);
+}
+
+kernel void spektrafilm_print_glare_blur_x(
+  device const float4 *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  destination[index] = spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, max(params.glareBlur, 0.0));
+}
+
+kernel void spektrafilm_print_glare_blur_y(
+  device const float4 *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  destination[index] = spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, max(params.glareBlur, 0.0));
+}
+
+kernel void spektrafilm_print_glare_apply(
+  device const float4 *linearSource [[buffer(0)]],
+  device const float4 *glareAmount [[buffer(1)]],
+  device float4 *destination [[buffer(2)]],
+  constant SpektraFrameConstants &frameConstants [[buffer(3)]],
+  constant uint2 &dims [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  float4 pixel = linearSource[index];
+  pixel.rgb += max(glareAmount[index].r, 0.0) * 0.01 * frameConstants.glare.rgb;
+  destination[index] = pixel;
 }
 
 static float4 spektra_texture2d_sample(

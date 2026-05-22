@@ -88,6 +88,8 @@ as they go beyond the scope of LUT capabilites.
 
 The LUTs are designed to easily work for dailies, on-set monitoring, cross-platform editing and many other workflows.
 
+For spatial effects, `Film Format` defines the shared virtual film gate used by grain, halation, diffusion, DIR, and scanner optics. Crops and enlarger transforms sample smaller regions of that same negative; output resolution only changes sampling density.
+
 ### Push and Pull Modes
 
 The film-development controls include two push/pull approaches:
