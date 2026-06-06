@@ -328,20 +328,6 @@ controlled through compile definitions and parameter visibility rules in
 
 ## Development Notes
 
-For detailed profiling of `spektrafilm_final_from_film_density`, configure a
-source-enabled Metal build and run:
-
-```sh
-cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSPEKTRAFILM_METAL_PROFILE_SOURCES=ON
-cmake --build build-profile --target SpektraFilmPerfHarness SpektraFilmParityHarness
-python3 tools/run_final_core_profile.py --build-dir build-profile --output profile-runs/final-core --capture-gputrace
-```
-
-The helper records representative fused timing, a diagnostic four-stage
-breakdown, and a threadgroup sweep. Staged mode adds intermediate writes and
-dispatch overhead, so only use it for attribution; use the fused result and
-parity-gated candidate sweep to judge optimizations.
-
 The plugin is still an active development project. The public flavors prioritize
 controls that are useful and reasonably defensible in grading workflows. The dev
 flavor keeps deeper controls available so that modeling decisions can be tested
